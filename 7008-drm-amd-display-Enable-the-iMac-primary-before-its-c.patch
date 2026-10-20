@@ -1,0 +1,69 @@
+From 5b3641d319c27f8469bea6109037b9f0383f04d2 Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Tue, 20 Oct 2026 10:38:27 +1100
+Subject: [PATCH 5/5] drm/amd/display: Enable the iMac primary before its
+ companion
+
+In reversed-CRTC tests, companion training failed when it ran before the
+primary was up.
+
+If the companion's master pipe was allocated first, swap the enable
+order of the two mapped master pipes. Leave unrelated enable slots and
+child pipes in place, and preserve reset order and the decisions to skip
+unchanged pipes. Changing only the primary still does not force the
+companion to be reprogrammed.
+
+Signed-off-by: Ed Schofield <ed@aicharmers.com>
+---
+ .../amd/display/dc/hwss/dce110/dce110_hwseq.c | 26 ++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+index 328321961fba2699b274d26199d5fd400c459174..5536324e82c0a6e57bd9d07f6391b5fb99a1b5c8 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+@@ -2657,7 +2657,8 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 	struct dce_hwseq *hws = dc->hwseq;
+ 	struct dc_bios *dcb = dc->ctx->dc_bios;
+ 	enum dc_status status;
+-	unsigned int i;
++	unsigned int i, n, enable_order[MAX_PIPES];
++	int primary = -1, companion = -1;
+ 	bool was_hpo_acquired = resource_is_hpo_acquired(dc->current_state);
+ 	bool is_hpo_acquired = resource_is_hpo_acquired(context);
+ 
+@@ -2706,10 +2707,29 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 		dc->hwseq->funcs.setup_hpo_hw_control(dc->hwseq, is_hpo_acquired);
+ 	}
+ 
++	/* The companion receiver needs the primary powered: enable it first. */
+ 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		enable_order[i] = i;
++		if (!pipe->stream || pipe->top_pipe || pipe->prev_odm_pipe)
++			continue;
++		if (pipe->stream->link == dc->imac5k_pair.primary)
++			primary = i;
++		else if (pipe->stream->link == dc->imac5k_pair.companion)
++			companion = i;
++	}
++	if (companion >= 0 && primary > companion) {
++		enable_order[companion] = primary;
++		enable_order[primary] = companion;
++	}
++
++	for (n = 0; n < dc->res_pool->pipe_count; n++) {
+ 		struct pipe_ctx *pipe_ctx_old =
+-					&dc->current_state->res_ctx.pipe_ctx[i];
+-		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
++			&dc->current_state->res_ctx.pipe_ctx[enable_order[n]];
++		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[enable_order[n]];
++
++		i = enable_order[n];
+ 
+ 		if (pipe_ctx->stream == NULL)
+ 			continue;
+-- 
+2.54.0 (Apple Git-157)
+

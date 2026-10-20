@@ -1,0 +1,599 @@
+From 65819a93a49216b3750aa3cb038228c389d82c20 Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Tue, 20 Oct 2026 10:38:26 +1100
+Subject: [PATCH 3/5] drm/amd/display: Recover the iMac companion after resume
+
+Resume detection can run before the companion tile is ready. With
+recovery disabled, the first ordinary S3 resume lost DP-1.
+
+Before restoring and freeing the cached display state, record the mapped
+connectors if the saved primary is active at 2560x2880. Allow an inactive
+companion. Scaled single-stream modes keep the base driver's emulated
+companion. Check the saved CRTC mode: imac5K_using_5K records mode history
+and can outlive the stream.
+
+Keep the cached-state restore warning, and queue a worker only if the
+return value reports success. Try at most three times: 500 ms after
+resume, then 1000 and 2000 ms after each failure.
+
+The primary-only case is important. An earlier revision required both
+tiles to be active and lost the companion's native identity after
+primary-only S3. A userspace probe, a 60-second wait and blank/wake did
+not bring it back, but an explicit ordinary detection did, without
+enabling the companion.
+
+On each attempt, cancel if the primary is inactive or either connector
+is forced. Detect the companion, then restore it on the route userspace
+currently uses. A code review showed that restoring the saved route
+would miss route changes or removal. Without a companion route,
+publish the sink and leave routing to userspace. Repeat the checks after
+detection, which drops the modeset locks.
+
+Skip work if a validated sink is already in the active stream or is
+already published without a route. Keep a successfully acquired sink
+across restore failures; a valid-looking sink left by failed detection
+still needs detection again.
+
+Send at most one hotplug event when the worker finishes. A change to the
+published sink still needs an event after late cancellation or if
+userspace restores the route first. An unresolved final attempt sends
+an event too. A sink acquired during resume and later disabled by
+userspace needs no extra event.
+
+Return restore failures as errno. Send hotplug events outside hpd_lock,
+and synchronously cancel the worker before releasing either connector
+reference. Keep ordinary HPD and DPMS handling unchanged.
+
+A successful atomic commit does not prove the link trained. GPU reset
+and the boot timeout fallback still need separate validation.
+
+Signed-off-by: Ed Schofield <ed@aicharmers.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/Makefile    |   1 +
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  23 +-
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |   2 +
+ .../display/amdgpu_dm/amdgpu_dm_connector.c   |  29 +-
+ .../display/amdgpu_dm/amdgpu_dm_connector.h   |   3 +
+ .../amd/display/amdgpu_dm/amdgpu_dm_imac5k.c  | 284 ++++++++++++++++++
+ .../amd/display/amdgpu_dm/amdgpu_dm_imac5k.h  |  29 ++
+ 7 files changed, 358 insertions(+), 13 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+ create mode 100644 drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile b/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
+index d1faf2d8370ff146361d3ec65ad26caa808efedc..815f29ca3ed141c3b7ada1d38ea5802f8fbab4e4 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/Makefile
+@@ -42,6 +42,7 @@ AMDGPUDM = \
+ 	amdgpu_dm_wb.o \
+ 	amdgpu_dm_colorop.o \
+ 	amdgpu_dm_ism.o \
++	amdgpu_dm_imac5k.o \
+ 	amdgpu_dm_backlight.o \
+ 	amdgpu_dm_audio.o \
+ 	amdgpu_dm_dmub.o \
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index c0a24c48e6ed5be29932e6a2a97364c890ff37e5..fd6333361869de9b6fb61f1df9c8c50e99ce3e83 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -518,6 +518,7 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 
+ 	adev->dm.ddev = adev_to_drm(adev);
+ 	adev->dm.adev = adev;
++	dm_imac5k_init(&adev->dm);
+ 
+ 	/* Zero all the fields */
+ 	memset(&init_data, 0, sizeof(init_data));
+@@ -906,6 +907,8 @@ static void amdgpu_dm_fini(struct amdgpu_device *adev)
+ {
+ 	int i;
+ 
++	dm_imac5k_cancel(&adev->dm);
++
+ 	if (adev->dm.vblank_control_workqueue) {
+ 		destroy_workqueue(adev->dm.vblank_control_workqueue);
+ 		adev->dm.vblank_control_workqueue = NULL;
+@@ -1568,7 +1571,7 @@ static int dm_cache_state(struct amdgpu_device *adev)
+ 	return adev->dm.cached_state ? 0 : r;
+ }
+ 
+-static void dm_destroy_cached_state(struct amdgpu_device *adev)
++static int dm_destroy_cached_state(struct amdgpu_device *adev)
+ {
+ 	struct amdgpu_display_manager *dm = &adev->dm;
+ 	struct drm_device *ddev = adev_to_drm(adev);
+@@ -1578,10 +1581,10 @@ static void dm_destroy_cached_state(struct amdgpu_device *adev)
+ 	struct drm_crtc_state *new_crtc_state;
+ 	struct drm_plane *plane;
+ 	struct drm_crtc *crtc;
+-	int i;
++	int i, ret;
+ 
+ 	if (!dm->cached_state)
+-		return;
++		return 0;
+ 
+ 	/* Force mode set in atomic commit */
+ 	for_each_new_crtc_in_state(dm->cached_state, crtc, new_crtc_state, i) {
+@@ -1614,9 +1617,12 @@ static void dm_destroy_cached_state(struct amdgpu_device *adev)
+ 		}
+ 	}
+ 
+-	drm_atomic_helper_resume(ddev, dm->cached_state);
++	ret = drm_atomic_helper_resume(ddev, dm->cached_state);
++	if (ret)
++		drm_warn(ddev, "Restoring cached display state failed: %d\n", ret);
+ 
+ 	dm->cached_state = NULL;
++	return ret;
+ }
+ 
+ static int dm_suspend(struct amdgpu_ip_block *ip_block)
+@@ -1663,6 +1669,9 @@ static int dm_suspend(struct amdgpu_ip_block *ip_block)
+ 		return 0;
+ 	}
+ 
++	/* The sole producer is resume; drain before caching the next state. */
++	dm_imac5k_cancel(dm);
++
+ 	if (!adev->dm.cached_state) {
+ 		int r = dm_cache_state(adev);
+ 
+@@ -2003,6 +2012,8 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 
+ 		return 0;
+ 	}
++	dm_imac5k_capture(dm);
++
+ 	/* Recreate dc_state - DC invalidates it when setting power state to S3. */
+ 	dc_state_release(dm_state->context);
+ 	dm_state->context = dc_state_create(dm->dc, NULL);
+@@ -2084,6 +2095,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 				dc_link_imac5k_arm(dm->dc->links[0]);
+ 			}
+ 			ret = dc_link_detect(aconnector->dc_link, DETECT_REASON_RESUMEFROMS3S4);
++			dm_imac5k_detected(aconnector, ret);
+ 			if (ret) {
+ 				/* w/a delay for certain panels */
+ 				amdgpu_dm_apply_delay_after_dpcd_poweroff(adev, aconnector->dc_sink);
+@@ -2100,7 +2112,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 	}
+ 	drm_connector_list_iter_end(&iter);
+ 
+-	dm_destroy_cached_state(adev);
++	r = dm_destroy_cached_state(adev);
+ 
+ 	/* Do mst topology probing after resuming cached state*/
+ 	drm_connector_list_iter_begin(ddev, &iter);
+@@ -2133,6 +2145,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 	amdgpu_dm_dump_links_and_sinks(adev);
+ 
+ 	amdgpu_dm_irq_resume_late(adev);
++	dm_imac5k_queue(dm, r);
+ 
+ 	amdgpu_dm_smu_write_watermarks_table(adev);
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index e75f04260fe2b154d47a6df778062c9432b3d389..6e84d0886398e7fab824a6b6086d598b9d8466cf 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -72,6 +72,7 @@ enum amd_vsdb_panel_type {
+ #include "irq_types.h"
+ #include "signal_types.h"
+ #include "amdgpu_dm_crc.h"
++#include "amdgpu_dm_imac5k.h"
+ #include "mod_info_packet.h"
+ struct aux_payload;
+ struct set_config_cmd_payload;
+@@ -606,6 +607,7 @@ struct amdgpu_display_manager {
+ 	 */
+ 	struct idle_workqueue *idle_workqueue;
+ 
++	struct dm_imac5k_recovery imac5k_recovery;
+ 	struct drm_atomic_commit *cached_state;
+ 	struct dc_state *cached_dc_state;
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+index 0b6d44890b8fe1cdf421b9c3a7cd754860b2da37..cd53dee4d487a554446ea3edf1932df2fa482d58 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+@@ -3593,36 +3593,49 @@ static int dm_force_atomic_commit(struct drm_connector *connector)
+  * This includes when a display is unplugged then plugged back into the
+  * same port and when running without usermode desktop manager support
+  */
+-void dm_restore_drm_connector_state(struct drm_device *dev,
+-				    struct drm_connector *connector)
++int dm_restore_drm_connector_state_result(struct drm_connector *connector,
++					  bool *attempted)
+ {
+ 	struct amdgpu_dm_connector *aconnector;
+ 	struct amdgpu_crtc *disconnected_acrtc;
+ 	struct dm_crtc_state *acrtc_state;
+ 
++	if (attempted)
++		*attempted = false;
++
+ 	if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+-		return;
++		return -ENODEV;
+ 
+ 	aconnector = to_amdgpu_dm_connector(connector);
+ 
+ 	if (!aconnector->dc_sink || !connector->state || !connector->encoder)
+-		return;
++		return -ENODEV;
+ 
+ 	disconnected_acrtc = to_amdgpu_crtc(connector->encoder->crtc);
+ 	if (!disconnected_acrtc)
+-		return;
++		return -ENODEV;
+ 
+ 	acrtc_state = to_dm_crtc_state(disconnected_acrtc->base.state);
+ 	if (!acrtc_state->stream)
+-		return;
++		return -ENODEV;
+ 
+ 	/*
+ 	 * If the previous sink is not released and different from the current,
+ 	 * we deduce we are in a state where we can not rely on usermode call
+ 	 * to turn on the display, so we do it here
+ 	 */
+-	if (acrtc_state->stream->sink != aconnector->dc_sink)
+-		dm_force_atomic_commit(&aconnector->base);
++	if (acrtc_state->stream->sink == aconnector->dc_sink)
++		return 0;
++
++	if (attempted)
++		*attempted = true;
++	return dm_force_atomic_commit(&aconnector->base);
++}
++
++void dm_restore_drm_connector_state(struct drm_device *dev,
++				    struct drm_connector *connector)
++{
++	dm_restore_drm_connector_state_result(connector, NULL);
+ }
+ 
+ static bool dm_edid_parser_send_cea(struct amdgpu_display_manager *dm,
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.h
+index 4e9eb3ff2c904ce834325e70e41021a44d4d1f90..e6862a14d4a89ef1125041db68a7091d4f086890 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.h
+@@ -74,6 +74,9 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
+ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connector,
+ 						    const struct drm_display_mode *mode);
+ 
++int dm_restore_drm_connector_state_result(struct drm_connector *connector,
++					  bool *attempted);
++
+ void dm_restore_drm_connector_state(struct drm_device *dev,
+ 				    struct drm_connector *connector);
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3c7d31c790a9f0e375f1ada7cba283e034dbb36
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+@@ -0,0 +1,284 @@
++// SPDX-License-Identifier: MIT
++/* Bounded resume recovery for the mapped iMac SST companion. */
++#include <drm/drm_atomic.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_probe_helper.h>
++
++#include "amdgpu.h"
++#include "amdgpu_dm.h"
++#include "amdgpu_dm_connector.h"
++#include "amdgpu_dm_hdcp.h"
++#include "dc.h"
++#include "dc/dc_stream.h"
++#include "dc/dc_dmub_srv.h"
++
++static const unsigned int recovery_delays_ms[] = { 500, 1000, 2000 };
++
++static bool valid_sink(struct dc_link *link)
++{
++	struct dc_sink *sink = link->local_sink;
++	const struct drm_edid *edid;
++	bool valid;
++
++	if (link->type != dc_connection_single || !sink ||
++	    sink->sink_signal != SIGNAL_TYPE_DISPLAY_PORT ||
++	    !sink->dc_edid.length ||
++	    sink->dc_edid.length > sizeof(sink->dc_edid.raw_edid))
++		return false;
++
++	edid = drm_edid_alloc(sink->dc_edid.raw_edid, sink->dc_edid.length);
++	valid = edid && drm_edid_valid(edid);
++	drm_edid_free(edid);
++	return valid;
++}
++
++/* hpd_lock held, including across detect: never bless a retained failed sink. */
++void dm_imac5k_detected(struct amdgpu_dm_connector *aconnector, bool detected)
++{
++	struct dm_imac5k_recovery *r = &drm_to_adev(aconnector->base.dev)->dm.imac5k_recovery;
++
++	if (r->connector != aconnector)
++		return;
++	if (r->acquired)
++		dc_sink_release(r->acquired);
++	r->acquired = NULL;
++	if (detected && valid_sink(aconnector->dc_link)) {
++		r->acquired = aconnector->dc_link->local_sink;
++		dc_sink_retain(r->acquired);
++	}
++}
++
++/* Current DRM routing, with modeset locks held; never recover a saved route. */
++static struct dc_stream_state *active_stream(struct amdgpu_dm_connector *aconnector)
++{
++	struct drm_connector *connector = &aconnector->base;
++	struct drm_crtc *crtc = connector->state ? connector->state->crtc : NULL;
++
++	if (!crtc || !connector->encoder || connector->encoder->crtc != crtc ||
++	    !crtc->state || !crtc->state->active)
++		return NULL;
++	return to_dm_crtc_state(crtc->state)->stream;
++}
++
++/* Modeset locks held. The primary check must not detect or power on eDP. */
++static const char *cancel_reason(struct dm_imac5k_recovery *r)
++{
++	struct dc *dc = drm_to_adev(r->connector->base.dev)->dm.dc;
++
++	if (!r->primary || r->primary->dc_link != dc->imac5k_pair.primary ||
++	    r->connector->dc_link != dc->imac5k_pair.companion)
++		return "pair_missing";
++	if (!r->connector->base.state)
++		return "state_missing";
++	if (r->primary->base.force != DRM_FORCE_UNSPECIFIED ||
++	    r->connector->base.force != DRM_FORCE_UNSPECIFIED)
++		return "forced";
++	return active_stream(r->primary) ? NULL : "primary_inactive";
++}
++
++/* hpd_lock held. A published sink may have been acquired by ordinary HPD. */
++static bool published_sink(struct amdgpu_dm_connector *aconnector)
++{
++	return aconnector->dc_sink && aconnector->dc_sink == aconnector->dc_link->local_sink &&
++		valid_sink(aconnector->dc_link);
++}
++
++/* hpd_lock held. Preserve acquisition provenance through restore failures. */
++static int acquire_sink(struct dm_imac5k_recovery *r)
++{
++	struct amdgpu_dm_connector *aconnector = r->connector;
++	struct drm_device *dev = aconnector->base.dev;
++	struct amdgpu_device *adev = drm_to_adev(dev);
++	struct dc_link *link = aconnector->dc_link;
++	struct dc_sink *old_sink;
++	bool detected;
++
++	/* An acquired sink survives restore errors; do not detect it again. */
++	if (!r->acquired || r->acquired != link->local_sink ||
++	    r->acquired != aconnector->dc_sink || !valid_sink(link)) {
++		if (adev->dm.hdcp_workqueue) {
++			hdcp_reset_display(adev->dm.hdcp_workqueue, link->link_index);
++			if (aconnector->base.state)
++				to_dm_connector_state(aconnector->base.state)->update_hdcp = true;
++		}
++		aconnector->fake_enable = false;
++		aconnector->timing_changed = false;
++		scoped_guard(mutex, &adev->dm.dc_lock) {
++			dc_exit_ips_for_hw_access(adev->dm.dc);
++			detected = dc_link_detect(link, DETECT_REASON_HPD);
++		}
++		dm_imac5k_detected(aconnector, detected);
++		/* Also reconcile a removed local sink when detect returned false. */
++		if (!link->local_sink || r->acquired) {
++			if (detected)
++				amdgpu_dm_apply_delay_after_dpcd_poweroff(
++					adev, aconnector->dc_sink);
++			old_sink = aconnector->dc_sink;
++			if (old_sink)
++				dc_sink_retain(old_sink);
++			amdgpu_dm_update_connector_after_detect(aconnector);
++			r->notify_pending |= old_sink != aconnector->dc_sink;
++			if (old_sink)
++				dc_sink_release(old_sink);
++		}
++		if (!detected || !r->acquired)
++			return -ENOLINK;
++	}
++
++	return 0;
++}
++
++/*
++ * Under hpd_lock, with DRM route checks under the modeset locks:
++ * forced/missing pair or inactive primary -> cancel;
++ * published sink with no route, or already in the active stream -> skip work;
++ * stale active stream -> acquire and restore on its current route;
++ * no active companion route -> acquire, leaving routing to userspace.
++ * Worker publication needs one terminal event, even after late cancellation.
++ * Resume acquisition alone does not leave a pending worker notification.
++ */
++static void recovery_work(struct work_struct *work)
++{
++	struct dm_imac5k_recovery *r = container_of(to_delayed_work(work),
++						 struct dm_imac5k_recovery, work);
++	struct amdgpu_dm_connector *aconnector = r->connector;
++	struct drm_device *dev = aconnector->base.dev;
++	struct dc_stream_state *stream;
++	const char *reason;
++	bool attempted = false, restored = false, already_acquired = false;
++	bool acquired_only = false, terminal, notify;
++	int ret = -ECANCELED;
++
++	mutex_lock(&aconnector->hpd_lock);
++	drm_modeset_lock_all(dev);
++	reason = cancel_reason(r);
++	if (!reason) {
++		r->attempt++;
++		stream = active_stream(aconnector);
++		if (published_sink(aconnector)) {
++			restored = stream && stream->sink == aconnector->dc_sink;
++			/* Our acquisition still needs its terminal notification. */
++			already_acquired = !stream && !r->notify_pending;
++		}
++	}
++	drm_modeset_unlock_all(dev);
++	if (!reason) {
++		ret = 0;
++		if (!restored && !already_acquired) {
++			ret = acquire_sink(r);
++			/* Detection drops modeset locks; routes and force may have changed. */
++			drm_modeset_lock_all(dev);
++			reason = cancel_reason(r);
++			if (reason) {
++				ret = -ECANCELED;
++			} else if (!ret) {
++				stream = active_stream(aconnector);
++				acquired_only = !stream;
++				restored = stream && stream->sink == aconnector->dc_sink;
++				if (!acquired_only && !restored)
++					ret = dm_restore_drm_connector_state_result(
++						&aconnector->base, &attempted);
++			}
++			drm_modeset_unlock_all(dev);
++		}
++	}
++	terminal = reason || !ret || r->attempt == ARRAY_SIZE(recovery_delays_ms);
++	notify = terminal && (r->notify_pending ||
++		(!reason && !restored && !already_acquired));
++	if (terminal)
++		r->notify_pending = false;
++	if (!terminal)
++		schedule_delayed_work(&r->work, msecs_to_jiffies(recovery_delays_ms[r->attempt]));
++	if (terminal && ret && !reason)
++		drm_warn(dev, "iMac recovery: attempt=%u acquired=%d commit=%d ret=%d terminal=%d link_active=%d already_restored=%d acquired_only=%d already_acquired=%d cancel=%s\n",
++			 r->attempt, r->acquired != NULL, attempted, ret, terminal,
++			 aconnector->dc_link->link_status.link_active, restored,
++			 acquired_only, already_acquired, reason ?: "none");
++	else
++		drm_info(dev, "iMac recovery: attempt=%u acquired=%d commit=%d ret=%d terminal=%d link_active=%d already_restored=%d acquired_only=%d already_acquired=%d cancel=%s\n",
++			 r->attempt, r->acquired != NULL, attempted, ret, terminal,
++			 aconnector->dc_link->link_status.link_active, restored,
++			 acquired_only, already_acquired, reason ?: "none");
++	mutex_unlock(&aconnector->hpd_lock);
++	if (notify)
++		drm_kms_helper_connector_hotplug_event(&aconnector->base);
++}
++
++void dm_imac5k_init(struct amdgpu_display_manager *dm)
++{
++	INIT_DELAYED_WORK(&dm->imac5k_recovery.work, recovery_work);
++}
++
++void dm_imac5k_cancel(struct amdgpu_display_manager *dm)
++{
++	struct dm_imac5k_recovery *r = &dm->imac5k_recovery;
++	struct amdgpu_dm_connector *aconnector = r->connector;
++
++	/* No IRQ/commit producer: only resume can start another episode. */
++	cancel_delayed_work_sync(&r->work);
++	if (!aconnector)
++		return;
++	mutex_lock(&aconnector->hpd_lock);
++	if (r->acquired)
++		dc_sink_release(r->acquired);
++	r->acquired = NULL;
++	r->notify_pending = false;
++	r->connector = NULL;
++	mutex_unlock(&aconnector->hpd_lock);
++	drm_connector_put(&aconnector->base);
++	drm_connector_put(&r->primary->base);
++	r->primary = NULL;
++}
++
++void dm_imac5k_capture(struct amdgpu_display_manager *dm)
++{
++	struct dm_imac5k_recovery *r = &dm->imac5k_recovery;
++	struct drm_connector *connector;
++	struct drm_connector_state *state;
++	struct drm_crtc_state *crtc_state;
++	struct amdgpu_dm_connector *aconnector, *primary;
++	int i;
++
++	if (!dm->cached_state || !dm->dc->imac5k_pair.companion ||
++	    !dm->dc->imac5k_pair.primary)
++		return;
++	primary = dm->dc->imac5k_pair.primary->priv;
++	if (!primary || primary->dc_link != dm->dc->imac5k_pair.primary ||
++	    primary->base.force != DRM_FORCE_UNSPECIFIED || primary->mst_root)
++		return;
++	/* Require an active saved tile-mode primary; the companion may be inactive. */
++	state = drm_atomic_get_new_connector_state(dm->cached_state, &primary->base);
++	if (!state || !state->crtc)
++		return;
++	crtc_state = drm_atomic_get_new_crtc_state(dm->cached_state, state->crtc);
++	if (!crtc_state || !crtc_state->active ||
++	    crtc_state->mode.hdisplay != 2560 || crtc_state->mode.vdisplay != 2880)
++		return;
++
++	for_each_new_connector_in_state(dm->cached_state, connector, state, i) {
++		if (connector->connector_type != DRM_MODE_CONNECTOR_DisplayPort ||
++		    connector->force != DRM_FORCE_UNSPECIFIED)
++			continue;
++		aconnector = to_amdgpu_dm_connector(connector);
++		if (aconnector->dc_link != dm->dc->imac5k_pair.companion || aconnector->mst_root)
++			continue;
++		guard(mutex)(&aconnector->hpd_lock);
++		drm_connector_get(connector);
++		drm_connector_get(&primary->base);
++		r->connector = aconnector;
++		r->primary = primary;
++		r->attempt = 0;
++		r->notify_pending = false;
++		return;
++	}
++}
++
++void dm_imac5k_queue(struct amdgpu_display_manager *dm, int restore_error)
++{
++	struct dm_imac5k_recovery *r = &dm->imac5k_recovery;
++
++	if (!r->connector)
++		return;
++	if (!restore_error)
++		schedule_delayed_work(&r->work, msecs_to_jiffies(recovery_delays_ms[0]));
++}
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f57ceb5c8259c0148daf2a5962e856dd29640e14
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef AMDGPU_DM_IMAC5K_H
++#define AMDGPU_DM_IMAC5K_H
++
++#include <linux/workqueue.h>
++
++struct amdgpu_display_manager;
++struct amdgpu_dm_connector;
++struct dc_sink;
++
++/* Resume owns both connector references until synchronous cancellation. */
++struct dm_imac5k_recovery {
++	struct delayed_work work;
++	struct amdgpu_dm_connector *connector;
++	struct amdgpu_dm_connector *primary;
++	/* Remaining fields are serialized by the companion hpd_lock. */
++	struct dc_sink *acquired;
++	unsigned int attempt;
++	/* Worker publication awaiting a terminal hotplug event. */
++	bool notify_pending;
++};
++
++void dm_imac5k_init(struct amdgpu_display_manager *dm);
++void dm_imac5k_cancel(struct amdgpu_display_manager *dm);
++void dm_imac5k_capture(struct amdgpu_display_manager *dm);
++void dm_imac5k_detected(struct amdgpu_dm_connector *aconnector, bool detected);
++void dm_imac5k_queue(struct amdgpu_display_manager *dm, int restore_error);
++
++#endif
+-- 
+2.54.0 (Apple Git-157)
+

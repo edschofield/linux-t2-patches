@@ -1,0 +1,136 @@
+From 5b230079ceb5dfe6ac9650c68b237fcf24709531 Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Tue, 20 Oct 2026 10:38:26 +1100
+Subject: [PATCH 2/5] drm/amd/display: Wait for the iMac companion at boot
+
+Boot detection can reach the companion before HPD is ready. Check that
+the primary is in D0 and arm the companion, then poll its HPD and AUX
+within a single 150 ms budget. Do not power the primary on again if its
+detection failed. An AUX operation already in progress may finish after
+the deadline.
+
+Skip companion detection if preparation fails. A later HPD event can
+retry it; enabling interrupts while HPD is already high is not a proven
+fallback. Keep the existing choice between real and emulated sinks on S3
+resume.
+
+Signed-off-by: Ed Schofield <ed@aicharmers.com>
+---
+ .../drm/amd/display/dc/link/link_detection.c  |  4 ++
+ .../gpu/drm/amd/display/dc/link/link_imac5k.c | 60 +++++++++++++++++++
+ .../gpu/drm/amd/display/dc/link/link_imac5k.h |  7 +++
+ 3 files changed, 71 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+index b6794df88ccd5630b8081a71a3549383a9eb5f47..9cc20b4cb4ee69b95640df9b92bab4324c5955a9 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+@@ -1632,6 +1632,10 @@ bool link_detect(struct dc_link *link, enum dc_detect_reason reason)
+ 	bool is_delegated_to_mst_top_mgr = false;
+ 	enum dc_connection_type pre_link_type = link->type;
+ 
++	if (reason == DETECT_REASON_BOOT && link_imac5k_is_companion(link) &&
++	    !link_imac5k_prepare_companion(link))
++		return false;
++
+ 	is_local_sink_detect_success = detect_link_and_local_sink(link, reason);
+ 
+ 	if (is_local_sink_detect_success && link->local_sink) {
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_imac5k.c b/drivers/gpu/drm/amd/display/dc/link/link_imac5k.c
+index 08d1018d950346cf8de273a637f039e0d34557bb..1a42111eda91b56226ea0cd316585da1a63be16e 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_imac5k.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_imac5k.c
+@@ -11,8 +11,13 @@
+  * Nothing here takes DM locks, detects connectors or emits hotplug events.
+  */
+ 
++#include <linux/delay.h>
++#include <linux/math64.h>
++
+ #include "link_imac5k.h"
++#include "dm_services.h"
+ #include "protocols/link_dpcd.h"
++#include "protocols/link_hpd.h"
+ 
+ #define DC_LOGGER \
+ 	link->ctx->logger
+@@ -60,3 +65,58 @@ enum dc_status link_imac5k_arm(struct dc_link *link)
+ 		  IMAC5K_DPCD_COMPANION_ENABLE, value, status);
+ 	return status;
+ }
++
++#define IMAC5K_READY_TIMEOUT_US		150000
++#define IMAC5K_READY_POLL_US		1000
++
++static unsigned long long imac5k_elapsed_us(struct dc_context *ctx,
++		unsigned long long start)
++{
++	return div_u64(dm_get_elapse_time_in_ns(ctx, dm_get_timestamp(ctx), start),
++		       1000);
++}
++
++/**
++ * link_imac5k_prepare_companion() - wait for companion boot readiness
++ * @link: the mapped companion link
++ *
++ * Primary boot detection has already powered the panel and waited for HPD.
++ * Check D0 and arm, then wait for companion HPD and AUX on one deadline.
++ * An AUX operation already in flight may finish after the deadline.
++ *
++ * Return: true when primary D0/arm and companion HPD/AUX are ready. This
++ * does not certify sink acquisition, link training or video restoration.
++ */
++bool link_imac5k_prepare_companion(struct dc_link *link)
++{
++	struct dc_link *primary = link->dc->imac5k_pair.primary;
++	unsigned long long start = dm_get_timestamp(link->ctx);
++	const char *stage = "primary not at D0";
++	uint8_t value;
++	bool hpd;
++
++	if (core_link_read_dpcd(primary, DP_SET_POWER, &value, 1) != DC_OK ||
++	    (value & DP_SET_POWER_MASK) != DP_SET_POWER_D0)
++		goto skip;
++
++	stage = "primary arm failed";
++	if (link_imac5k_arm(primary) != DC_OK)
++		goto skip;
++
++	for (;;) {
++		hpd = link_get_hpd_state(link);
++		stage = hpd ? "companion AUX not ready" : "companion HPD low";
++		if (imac5k_elapsed_us(link->ctx, start) >= IMAC5K_READY_TIMEOUT_US)
++			break;
++		if (hpd && core_link_read_dpcd(link, DP_DPCD_REV, &value, 1) == DC_OK) {
++			DC_LOG_DC("iMac 5K: boot companion ready after %llu us\n",
++				  imac5k_elapsed_us(link->ctx, start));
++			return true;
++		}
++		fsleep(IMAC5K_READY_POLL_US);
++	}
++skip:
++	DC_LOG_INFO("iMac 5K: skip boot companion: %s after %llu us\n",
++		    stage, imac5k_elapsed_us(link->ctx, start));
++	return false;
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_imac5k.h b/drivers/gpu/drm/amd/display/dc/link/link_imac5k.h
+index 46505099a574f4dd89670be7d5c918e99313a010..989eec6b2c0f7557b5d2f127837ddd9abe9d2fbc 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_imac5k.h
++++ b/drivers/gpu/drm/amd/display/dc/link/link_imac5k.h
+@@ -9,6 +9,13 @@ static inline bool link_imac5k_is_primary(const struct dc_link *link)
+ 	return link && link == link->dc->imac5k_pair.primary;
+ }
+ 
++static inline bool link_imac5k_is_companion(const struct dc_link *link)
++{
++	return link && link == link->dc->imac5k_pair.companion;
++}
++
+ enum dc_status link_imac5k_arm(struct dc_link *link);
+ 
++bool link_imac5k_prepare_companion(struct dc_link *link);
++
+ #endif /* __LINK_IMAC5K_H__ */
+-- 
+2.54.0 (Apple Git-157)
+

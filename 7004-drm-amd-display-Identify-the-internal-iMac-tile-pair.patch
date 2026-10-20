@@ -1,0 +1,380 @@
+From f9da8926474785c7a86e27f5a799fdbd8b2ab9c6 Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Tue, 20 Oct 2026 08:39:36 +1100
+Subject: [PATCH 1/5] drm/amd/display: Identify the internal iMac tile pair
+
+Map the internal pair only on iMac20,1 systems with the expected PCI
+identity and physical wiring.
+
+Read the register that enables the companion before writing it, and
+return AUX errors to the caller. Re-arm only after the primary
+successfully enters D0. Keep the original handling for unmapped links,
+synchronous training and failed power writes.
+
+Signed-off-by: Ed Schofield <ed@aicharmers.com>
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 60 ++++++++++++++++--
+ .../drm/amd/display/dc/core/dc_link_exports.c |  5 ++
+ drivers/gpu/drm/amd/display/dc/dc.h           | 10 +++
+ .../gpu/drm/amd/display/dc/inc/link_service.h |  1 +
+ drivers/gpu/drm/amd/display/dc/link/Makefile  |  2 +-
+ .../drm/amd/display/dc/link/link_detection.c  |  7 +--
+ .../drm/amd/display/dc/link/link_factory.c    |  2 +
+ .../gpu/drm/amd/display/dc/link/link_imac5k.c | 62 +++++++++++++++++++
+ .../gpu/drm/amd/display/dc/link/link_imac5k.h | 14 +++++
+ .../display/dc/link/protocols/link_dp_phy.c   |  9 ++-
+ 10 files changed, 158 insertions(+), 14 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/display/dc/link/link_imac5k.c
+ create mode 100644 drivers/gpu/drm/amd/display/dc/link/link_imac5k.h
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 7161f8a959a536bca8964a2bec2949e09140b648..c0a24c48e6ed5be29932e6a2a97364c890ff37e5 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -30,6 +30,7 @@
+ #include "dm_services_types.h"
+ #include "dc.h"
+ #include "link_enc_cfg.h"
++#include "dc/inc/hw/link_encoder.h"
+ #include "dc/inc/core_types.h"
+ #include "dal_asic_id.h"
+ #include "dmub/dmub_srv.h"
+@@ -82,6 +83,7 @@
+ #include <linux/types.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/pci.h>
++#include <linux/dmi.h>
+ #include <linux/power_supply.h>
+ #include <linux/firmware.h>
+ #include <linux/component.h>
+@@ -460,6 +462,54 @@ static int amdgpu_dm_init_power_module(struct amdgpu_display_manager *dm)
+ 	return 0;
+ }
+ 
++/*
++ * Map the iMac internal 5K tile pair for DC. Only the iMac20,1 / Radeon Pro
++ * 5300 wiring is known: the sole eDP at link 0 and a physical, non-USB-C DP
++ * port at link 1. Anything else, including another iMac 5K board, stays
++ * unmapped and keeps the original handling.
++ */
++static void dm_imac5k_map_pair(struct amdgpu_device *adev)
++{
++	struct dc *dc = adev->dm.dc;
++	struct pci_dev *pdev = adev->pdev;
++	struct dc_link *primary, *companion;
++	unsigned int i, edp_count = 0;
++
++	if (!dc->config.imac5K_support)
++		return;
++
++	if (!dmi_match(DMI_PRODUCT_NAME, "iMac20,1") ||
++	    pdev->device != 0x7340 || pdev->subsystem_vendor != 0x106b ||
++	    pdev->subsystem_device != 0x0218 || dc->link_count < 2)
++		goto unmapped;
++
++	primary = dc->links[0];
++	companion = dc->links[1];
++	if (!primary || !companion ||
++	    primary->connector_signal != SIGNAL_TYPE_EDP ||
++	    companion->connector_signal != SIGNAL_TYPE_DISPLAY_PORT ||
++	    companion->ep_type != DISPLAY_ENDPOINT_PHY || !companion->link_enc ||
++	    companion->link_enc->features.flags.bits.DP_IS_USB_C)
++		goto unmapped;
++
++	for (i = 0; i < dc->link_count; i++)
++		if (dc->links[i] && dc->links[i]->connector_signal == SIGNAL_TYPE_EDP)
++			edp_count++;
++	if (edp_count != 1)
++		goto unmapped;
++
++	dc->imac5k_pair.primary = primary;
++	dc->imac5k_pair.companion = companion;
++	drm_info(adev_to_drm(adev), "iMac 5K: tile pair mapped: primary link %u, companion link %u\n",
++		 primary->link_index, companion->link_index);
++	return;
++
++unmapped:
++	drm_info(adev_to_drm(adev), "iMac 5K: no tile pair mapping for %04x:%04x %04x:%04x\n",
++		 pdev->vendor, pdev->device, pdev->subsystem_vendor,
++		 pdev->subsystem_device);
++}
++
+ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ {
+ 	struct dc_init_data init_data;
+@@ -636,6 +686,8 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 		goto error;
+ 	}
+ 
++	dm_imac5k_map_pair(adev);
++
+ 	if (amdgpu_dc_debug_mask & DC_DISABLE_PIPE_SPLIT) {
+ 		adev->dm.dc->debug.force_single_disp_pipe_split = false;
+ 		adev->dm.dc->debug.pipe_split_policy = MPC_SPLIT_AVOID;
+@@ -2029,9 +2081,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 			dc_exit_ips_for_hw_access(dm->dc);
+ 			if (dm->dc->config.imac5K_using_5K &&
+ 					aconnector->dc_link->link_index == 1) {
+-				const u8 value = 1;
+-
+-				core_link_write_dpcd(dm->dc->links[0], 0x4F1, &value, 1);
++				dc_link_imac5k_arm(dm->dc->links[0]);
+ 			}
+ 			ret = dc_link_detect(aconnector->dc_link, DETECT_REASON_RESUMEFROMS3S4);
+ 			if (ret) {
+@@ -4654,9 +4704,7 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_commit *state,
+ 				continue;
+ 
+ 			if (new_crtc_state->mode.vdisplay == 2880 && new_crtc_state->mode.hdisplay == 2560) {
+-				u8 value = 1;
+-
+-				core_link_write_dpcd(dm->dc->links[0], 0x4F1, &value, 1);
++				dc_link_imac5k_arm(dm->dc->links[0]);
+ 				dm->dc->config.imac5K_using_5K = true;
+ 			} else
+ 				dm->dc->config.imac5K_using_5K = false;
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_link_exports.c b/drivers/gpu/drm/amd/display/dc/core/dc_link_exports.c
+index 14fc4ef482f16ff912a85362cb008dd75f779c48..fc5baf4bcd53fed8530945c1bc5a3bda88ebeeaa 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_exports.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_exports.c
+@@ -87,6 +87,11 @@ bool dc_link_detect(struct dc_link *link, enum dc_detect_reason reason)
+ 	return link->dc->link_srv->detect_link(link, reason);
+ }
+ 
++enum dc_status dc_link_imac5k_arm(struct dc_link *link)
++{
++	return link->dc->link_srv->imac5k_arm(link);
++}
++
+ bool dc_link_detect_connection_type(struct dc_link *link,
+ 		enum dc_connection_type *type)
+ {
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 022707594911316134175288335ffb06ed1533dc..b511e9720954ba2a7237c6a97387d617f8fe24d3 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -1995,6 +1995,12 @@ struct dc_scratch_space {
+ 	enum backlight_control_type backlight_control_type;
+ };
+ 
++/* Stable, board-scoped wiring. Set before connector detection, never replaced. */
++struct dc_imac5k_pair {
++	struct dc_link *primary;
++	struct dc_link *companion;
++};
++
+ struct dc {
+ 	struct dc_debug_options debug;
+ 	struct dc_versions versions;
+@@ -2002,6 +2008,7 @@ struct dc {
+ 	struct dc_check_config check_config;
+ 	struct dc_cap_funcs cap_funcs;
+ 	struct dc_config config;
++	struct dc_imac5k_pair imac5k_pair;
+ 	struct dc_bounding_box_overrides bb_overrides;
+ 	struct dc_bug_wa work_arounds;
+ 	struct dc_context *ctx;
+@@ -2505,6 +2512,9 @@ void dc_set_edp_power(const struct dc *dc, struct dc_link *edp_link,
+  */
+ bool dc_link_detect(struct dc_link *link, enum dc_detect_reason reason);
+ 
++/* Checked arm on the mapped primary, legacy write elsewhere. */
++enum dc_status dc_link_imac5k_arm(struct dc_link *link);
++
+ struct dc_sink_init_data;
+ 
+ /* When link connection type is dc_connection_mst_branch, remote sink can be
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/link_service.h b/drivers/gpu/drm/amd/display/dc/inc/link_service.h
+index 026d28046eea03a555fdb64dec6ac9aa2286e35d..aa525bf370c8748c1379709e7ba0ee73864f39e3 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/link_service.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/link_service.h
+@@ -105,6 +105,7 @@ struct link_service {
+ 
+ 	/************************** Detection *********************************/
+ 	bool (*detect_link)(struct dc_link *link, enum dc_detect_reason reason);
++	enum dc_status (*imac5k_arm)(struct dc_link *link);
+ 	bool (*detect_connection_type)(struct dc_link *link,
+ 			enum dc_connection_type *type);
+ 	struct dc_sink *(*add_remote_sink)(
+diff --git a/drivers/gpu/drm/amd/display/dc/link/Makefile b/drivers/gpu/drm/amd/display/dc/link/Makefile
+index f558a20eceaa7654358e420e49cc61a8bab7e6ec..63acf39957c3367a757186fb1b5c5ac10306c229 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/Makefile
++++ b/drivers/gpu/drm/amd/display/dc/link/Makefile
+@@ -24,7 +24,7 @@
+ # PHY, HPD, DDC and etc).
+ 
+ LINK = link_detection.o link_dpms.o link_factory.o link_resource.o \
+-link_validation.o
++link_validation.o link_imac5k.o
+ 
+ AMD_DAL_LINK = $(addprefix $(AMDDALPATH)/dc/link/, \
+ $(LINK))
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+index f254f2d9e0dd23cec00ea65a521df31d354af09b..b6794df88ccd5630b8081a71a3549383a9eb5f47 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+@@ -32,6 +32,7 @@
+ 
+ #include "link_dpms.h"
+ #include "link_detection.h"
++#include "link_imac5k.h"
+ #include "link_hwss.h"
+ #include "protocols/link_edp_panel_control.h"
+ #include "protocols/link_ddc.h"
+@@ -1203,10 +1204,8 @@ static bool detect_link_and_local_sink(struct dc_link *link,
+ 				if (!link->dpcd_caps.set_power_state_capable_edp)
+ 					link->wa_flags.dp_keep_receiver_powered = true;
+ 			}
+-			if (dc->config.imac5K_support) {
+-				const uint8_t val = 1;
+-				core_link_write_dpcd(link, 0x4F1, &val, 1);
+-			}
++			if (dc->config.imac5K_support)
++				link_imac5k_arm(link);
+ 			sink_caps.transaction_type = DDC_TRANSACTION_TYPE_I2C_OVER_AUX;
+ 			sink_caps.signal = SIGNAL_TYPE_EDP;
+ 			break;
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_factory.c b/drivers/gpu/drm/amd/display/dc/link/link_factory.c
+index 7146f8356233be75a20c7dad736b97e1222fa04d..41022cb2ff2da73b696f7f49023970a0ddeabc82 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_factory.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_factory.c
+@@ -31,6 +31,7 @@
+ #include "link_resource.h"
+ #include "link_validation.h"
+ #include "link_dpms.h"
++#include "link_imac5k.h"
+ #include "accessories/link_dp_cts.h"
+ #include "accessories/link_dp_trace.h"
+ #include "protocols/link_ddc.h"
+@@ -71,6 +72,7 @@ static void construct_link_service_factory(struct link_service *link_srv)
+ static void construct_link_service_detection(struct link_service *link_srv)
+ {
+ 	link_srv->detect_link = link_detect;
++	link_srv->imac5k_arm = link_imac5k_arm;
+ 	link_srv->detect_connection_type = link_detect_connection_type;
+ 	link_srv->add_remote_sink = link_add_remote_sink;
+ 	link_srv->remove_remote_sink = link_remove_remote_sink;
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_imac5k.c b/drivers/gpu/drm/amd/display/dc/link/link_imac5k.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..08d1018d950346cf8de273a637f039e0d34557bb
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/dc/link/link_imac5k.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: MIT
++/* FILE POLICY AND INTENDED USAGE:
++ * The iMac internal 5K panel is driven as two tiles: the left through an eDP
++ * link (the primary) and the right through a DP link (the companion). The
++ * companion's receiver only answers while the primary's panel holds vendor
++ * DPCD register 0x4F1 set to 1, and every DP_SET_POWER=D3 write to the
++ * primary clears it.
++ *
++ * DM maps the supported pair in dc->imac5k_pair. Existing callers use
++ * dc_lock to serialize AUX access; check serialization at each new caller.
++ * Nothing here takes DM locks, detects connectors or emits hotplug events.
++ */
++
++#include "link_imac5k.h"
++#include "protocols/link_dpcd.h"
++
++#define DC_LOGGER \
++	link->ctx->logger
++
++/* Vendor DPCD register on the primary that enables the companion's link. */
++#define IMAC5K_DPCD_COMPANION_ENABLE	0x4F1
++#define IMAC5K_COMPANION_ENABLE_ON	0x01
++
++/**
++ * link_imac5k_arm() - make sure the companion's link is enabled
++ * @link: the primary link selected by an existing iMac quirk caller
++ *
++ * On the mapped primary, read the register and write only if it is not 1. A
++ * live companion then avoids redundant writes. A failed read is a failure,
++ * not a sign that the register is clear. Unmapped links keep the original
++ * blind write. Nothing is cached.
++ *
++ * Return: DC_OK if the register reads, or was written to, 1; otherwise the
++ * failed read's or write's status.
++ */
++enum dc_status link_imac5k_arm(struct dc_link *link)
++{
++	uint8_t value = IMAC5K_COMPANION_ENABLE_ON;
++	enum dc_status status;
++
++	if (!link_imac5k_is_primary(link))
++		return core_link_write_dpcd(link, IMAC5K_DPCD_COMPANION_ENABLE,
++					    &value, sizeof(value));
++
++	status = core_link_read_dpcd(link, IMAC5K_DPCD_COMPANION_ENABLE,
++				     &value, sizeof(value));
++	if (status != DC_OK) {
++		DC_LOG_DC("iMac 5K: reading 0x%x failed: %d\n",
++			  IMAC5K_DPCD_COMPANION_ENABLE, status);
++		return status;
++	}
++
++	if (value == IMAC5K_COMPANION_ENABLE_ON)
++		return DC_OK;
++
++	value = IMAC5K_COMPANION_ENABLE_ON;
++	status = core_link_write_dpcd(link, IMAC5K_DPCD_COMPANION_ENABLE,
++				      &value, sizeof(value));
++	DC_LOG_DC("iMac 5K: wrote 0x%x=0x%02x: %d\n",
++		  IMAC5K_DPCD_COMPANION_ENABLE, value, status);
++	return status;
++}
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_imac5k.h b/drivers/gpu/drm/amd/display/dc/link/link_imac5k.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..46505099a574f4dd89670be7d5c918e99313a010
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/dc/link/link_imac5k.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef __LINK_IMAC5K_H__
++#define __LINK_IMAC5K_H__
++
++#include "link_service.h"
++
++static inline bool link_imac5k_is_primary(const struct dc_link *link)
++{
++	return link && link == link->dc->imac5k_pair.primary;
++}
++
++enum dc_status link_imac5k_arm(struct dc_link *link);
++
++#endif /* __LINK_IMAC5K_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
+index 49521ac4b0e85338bb7fc93c079eba45216ec700..628bf2a5194b2a52445ae7190294fc0247601dd6 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
+@@ -31,6 +31,7 @@
+  */
+ 
+ #include "link_dp_phy.h"
++#include "link/link_imac5k.h"
+ #include "link_dpcd.h"
+ #include "link_dp_training.h"
+ #include "link_dp_capability.h"
+@@ -44,15 +45,17 @@
+ void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
+ {
+ 	uint8_t state;
++	enum dc_status status;
+ 
+ 	state = on ? DP_POWER_STATE_D0 : DP_POWER_STATE_D3;
+ 
+ 	if (link->sync_lt_in_progress)
+ 		return;
+ 
+-	core_link_write_dpcd(link, DP_SET_POWER, &state,
+-						 sizeof(state));
+-
++	status = core_link_write_dpcd(link, DP_SET_POWER, &state, sizeof(state));
++	/* Primary D3 clears the arm; re-establish it after a successful D0. */
++	if (on && status == DC_OK && link_imac5k_is_primary(link))
++		link_imac5k_arm(link);
+ }
+ 
+ void dp_enable_link_phy(
+-- 
+2.54.0 (Apple Git-157)
+

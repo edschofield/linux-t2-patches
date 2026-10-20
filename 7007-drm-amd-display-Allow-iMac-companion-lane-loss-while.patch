@@ -1,0 +1,105 @@
+From d1e742ab03c31d09996ece0f06d51e20558eed86 Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Tue, 20 Oct 2026 10:38:26 +1100
+Subject: [PATCH 4/5] drm/amd/display: Allow iMac companion lane loss while
+ idle
+
+Use a fixed policy for the mapped SST companion: accept reported lane
+loss during the post-training idle check only if the AUX read succeeded.
+This lets video start before evaluating later lane stability.
+
+Keep the six-byte status sample in one private helper with an
+idle-context flag. Preserve the public wrapper and other callers, along
+with logging, the five-millisecond wait and post-training adjustment.
+
+Signed-off-by: Ed Schofield <ed@aicharmers.com>
+---
+ .../dc/link/protocols/link_dp_training.c      | 44 ++++++++++++++-----
+ 1 file changed, 34 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
+index 04eedec8a230cab91054316c63bb17dffb2b505c..dc29e36c316a6ce0858a9a2b2ae05f993870c9e8 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
+@@ -31,6 +31,7 @@
+  * of link encoding and back end hardware.
+  */
+ #include "link_dp_training.h"
++#include "link/link_imac5k.h"
+ #include "link_dp_training_8b_10b.h"
+ #include "link_dp_training_128b_132b.h"
+ #include "link_dp_training_auxless.h"
+@@ -550,21 +551,22 @@ bool dp_check_dpcd_reqeust_status(const struct dc_link *link,
+ 	return (status != DC_OK && link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA);
+ }
+ 
+-enum link_training_result dp_check_link_loss_status(
+-	struct dc_link *link,
+-	const struct link_training_settings *link_training_setting)
++static enum link_training_result dp_read_link_loss_status(
++	struct dc_link *link, bool video_idle)
+ {
+-	(void)link_training_setting;
+-	enum link_training_result status = LINK_TRAINING_SUCCESS;
++	enum link_training_result status = LINK_TRAINING_SUCCESS, result;
++	enum dc_status aux_status;
++	uint8_t dpcd_buf[6] = {0};
++	bool imac_idle = video_idle && link_imac5k_is_companion(link) &&
++		link->type == dc_connection_single;
+ 	union lane_status lane_status;
+ 	union lane_align_status_updated dpcd_lane_status_updated;
+-	uint8_t dpcd_buf[6] = {0};
+ 	uint32_t lane;
+ 
+-	core_link_read_dpcd(
++	aux_status = core_link_read_dpcd(
+ 			link,
+ 			DP_SINK_COUNT,
+-			(uint8_t *)(dpcd_buf),
++			dpcd_buf,
+ 			sizeof(dpcd_buf));
+ 
+ 	/*parse lane status*/
+@@ -589,7 +591,29 @@ enum link_training_result dp_check_link_loss_status(
+ 		}
+ 	}
+ 
+-	return status;
++	if (!imac_idle)
++		return status;
++
++	result = status;
++	/* Never turn a failed AUX transaction into successful training. */
++	if (aux_status != DC_OK)
++		result = LINK_TRAINING_LINK_LOSS;
++	else if (status == LINK_TRAINING_LINK_LOSS)
++		result = LINK_TRAINING_SUCCESS;
++
++	if (status == LINK_TRAINING_LINK_LOSS)
++		DC_LOG_INFO("iMac 5K: idle link=%u aux=%d lanes=%02x%02x%02x status=%d result=%d\n",
++			    link->link_index, aux_status,
++			    dpcd_buf[2], dpcd_buf[3], dpcd_buf[4], status, result);
++	return result;
++}
++
++enum link_training_result dp_check_link_loss_status(
++	struct dc_link *link,
++	const struct link_training_settings *link_training_setting)
++{
++	(void)link_training_setting;
++	return dp_read_link_loss_status(link, false);
+ }
+ 
+ enum dc_status dp_get_lane_status_and_lane_adjust(
+@@ -1531,7 +1555,7 @@ static enum link_training_result dp_transition_to_video_idle(
+ 		if (link->connector_signal != SIGNAL_TYPE_EDP && status == LINK_TRAINING_SUCCESS) {
+ 			msleep(5);
+ 			if (!link->skip_fallback_on_link_loss)
+-				status = dp_check_link_loss_status(link, lt_settings);
++				status = dp_read_link_loss_status(link, true);
+ 		}
+ 		return status;
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
