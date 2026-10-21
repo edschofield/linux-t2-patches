@@ -1,11 +1,17 @@
-# iMac 5K: Simple V2 and V3 for review
+# iMac 5K: Simple V2 and Simple V3 for review
 
-These are revisions 2 and 3 of the small Simple V1 series, offered for
-review while hardware validation continues. They follow
+These are Simple V2 and Simple V3, offered for review while hardware
+validation continues. They follow
 [Atharva's request for a smaller patch set](https://github.com/t2linux/wiki/issues/743#issuecomment-6290452376).
 V2 has five patches, adding 105 lines and removing 15. V3 adds a sixth
 patch: a 22-line wait before detecting the right tile at boot. Both change
 eight existing kernel files, with no new kernel files or recovery worker.
+
+The version names are Simple V1, Simple V2 and Simple V3. Simple V1 was
+the initial source version (`4086e5724`). Simple V2 added the EDID restore
+after a forced connector probe. Simple V3 adds the boot wait. The source
+and release table below retains the original build identifiers so the
+versions can be matched to their test logs.
 
 - [V2: five patches](https://github.com/edschofield/linux-t2-patches/tree/draft/imac5k-simple-v2)
 - [V3: six patches](https://github.com/edschofield/linux-t2-patches/tree/draft/imac5k-simple-v3)
