@@ -1,0 +1,143 @@
+From 289577f22c1307cdd8e65d2b405ecf73ae3f1634 Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Wed, 21 Oct 2026 05:09:18 +1100
+Subject: [PATCH] drm/amd/display: Hold the iMac companion's identity across a
+ dark resume
+
+GNOME's idle path blanks the pair and then suspends. The hold keeps the
+companion's identity through the blank and the suspend commit, but it is
+closed for S3. Native resume then releases the companion's sink and runs
+real detection while the pair is still dark: the primary is in D3, the
+companion's HPD is low, and detection publishes it as disconnected until
+wake. Wake brings it back through ordinary HPD detection as a new sink,
+with a forced restore and further hotplug events. In a scaled mode the
+identity is kept, but the hold reopens unset with HPD already low, so the
+wake's rising HPD still takes the ordinary path and sends an event.
+
+When the cached state that resume restores leaves both pair connectors
+without an active CRTC, and the companion's HPD is low, keep its real,
+valid, published sink instead of detecting it, in native mode as already
+in the scaled branch, and set the hold while it is still closed. Reopening
+admits that hold, so the wake commit queues the existing wake check, which
+confirms the companion or runs ordinary detection once. Closing still
+drops the hold. A pair that resumes lit, a high HPD and a companion without
+a valid published sink keep their existing paths.
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |  4 +-
+ .../amd/display/amdgpu_dm/amdgpu_dm_imac5k.c  | 51 ++++++++++++++++---
+ .../amd/display/amdgpu_dm/amdgpu_dm_imac5k.h  |  5 +-
+ 3 files changed, 50 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 40e52ff5b04615587e6ae97c911fad5e6296ada2..f5d101596f4edcc4e53a7ee0176222d256fb7adb 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2094,9 +2094,9 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 		} else if (dm->dc->config.imac5K_support &&
+ 			   !dm->dc->config.imac5K_using_5K &&
+ 			   aconnector->dc_link->link_index == 1) {
+-			if (!dm_imac5k_keep_companion(aconnector))
++			if (!dm_imac5k_keep_companion(aconnector, true))
+ 				amdgpu_dm_emulated_link_detect(aconnector->dc_link);
+-		} else {
++		} else if (!dm_imac5k_keep_companion(aconnector, false)) {
+ 			guard(mutex)(&dm->dc_lock);
+ 			dc_exit_ips_for_hw_access(dm->dc);
+ 			if (dm->dc->config.imac5K_using_5K &&
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+index db44035f08fa5f51cbf2544ff5c9c4767cfd3aff..4823586be59bfd3345701c0240a298d993b43b40 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+@@ -236,16 +236,53 @@ static bool companion_identity(struct amdgpu_dm_connector *aconnector)
+ 		published_sink(aconnector);
+ }
+ 
++/* Resume: restoring the cached state leaves the connector without an active CRTC. */
++static bool cached_dark(struct drm_atomic_commit *state, struct amdgpu_dm_connector *aconnector)
++{
++	struct drm_connector_state *conn_state;
++	struct drm_crtc_state *crtc_state;
++
++	if (!state)
++		return false;
++	conn_state = drm_atomic_get_new_connector_state(state, &aconnector->base);
++	if (!conn_state)
++		return false;
++	if (!conn_state->crtc)
++		return true;
++	crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
++	return crtc_state && !crtc_state->active;
++}
++
+ /*
+- * Resume, hpd_lock held, in 7003's scaled-mode branch only. Emulation would
+- * read EDID before the primary is re-armed and replace the real sink with
+- * a virtual one; the board-fixed companion keeps its published identity.
++ * Resume, hpd_lock held, with the hold closed. In 7003's scaled-mode branch
++ * (scaled), emulation would read EDID before the primary is re-armed and
++ * replace the real sink with a virtual one, so the board-fixed companion
++ * keeps its published identity. In native mode, detection of a pair that
++ * resumes dark finds HPD low and would publish a disconnect, so the identity
++ * is kept only then. A pair resuming dark with HPD low reopens held, and
++ * its wake commit queues the check.
+  */
+-bool dm_imac5k_keep_companion(struct amdgpu_dm_connector *aconnector)
++bool dm_imac5k_keep_companion(struct amdgpu_dm_connector *aconnector, bool scaled)
+ {
++	struct drm_device *dev = aconnector->base.dev;
++	struct amdgpu_display_manager *dm = &drm_to_adev(dev)->dm;
++	bool dark;
++
+ 	if (!companion_identity(aconnector))
+ 		return false;
+-	drm_info(aconnector->base.dev, "iMac 5K: keeping companion identity across scaled resume\n");
++	dark = cached_dark(dm->cached_state, aconnector) &&
++		cached_dark(dm->cached_state, dm->dc->imac5k_pair.primary->priv);
++	scoped_guard(mutex, &dm->dc_lock) {
++		dark = dark && !dc_link_get_hpd_state(aconnector->dc_link);
++		if (dark)
++			dm->imac5k_hold.held = true;
++	}
++	if (!scaled && !dark)
++		return false;
++	if (scaled)
++		drm_info(dev, "iMac 5K: keeping companion identity across scaled resume\n");
++	if (dark)
++		drm_info(dev, "iMac 5K: holding companion identity across resume while the pair is dark\n");
+ 	return true;
+ }
+ 
+@@ -355,7 +392,9 @@ static void hold_admit(struct amdgpu_display_manager *dm, bool closed)
+ 	guard(mutex)(&aconnector->hpd_lock);
+ 	guard(mutex)(&dm->dc_lock);
+ 	dm->imac5k_hold.closed = closed;
+-	dm->imac5k_hold.held = false;
++	/* Opening admits a hold armed by resume; closing drops it. */
++	if (closed)
++		dm->imac5k_hold.held = false;
+ }
+ 
+ void dm_imac5k_hold_open(struct amdgpu_display_manager *dm)
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+index 20c477efc49742036cd46f78e5a87bb909900167..3cd75825cea25330141e3ffcba31defe0811b1ac 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+@@ -24,7 +24,8 @@ struct dm_imac5k_recovery {
+ /*
+  * The companion's published identity, held while the pair is dark. closed
+  * and held are written under the companion's hpd_lock and then dc_lock;
+- * either lock alone is enough to read them.
++ * either lock alone is enough to read them. Resume may set held while
++ * closed; opening then admits it.
+  */
+ struct dm_imac5k_hold {
+ 	struct delayed_work work;
+@@ -37,7 +38,7 @@ void dm_imac5k_cancel(struct amdgpu_display_manager *dm);
+ void dm_imac5k_capture(struct amdgpu_display_manager *dm);
+ void dm_imac5k_detected(struct amdgpu_dm_connector *aconnector, bool detected);
+ void dm_imac5k_queue(struct amdgpu_display_manager *dm, int restore_error);
+-bool dm_imac5k_keep_companion(struct amdgpu_dm_connector *aconnector);
++bool dm_imac5k_keep_companion(struct amdgpu_dm_connector *aconnector, bool scaled);
+ bool dm_imac5k_hold_hpd(struct amdgpu_dm_connector *aconnector);
+ void dm_imac5k_hold_commit(struct amdgpu_display_manager *dm,
+ 			   const struct dc_commit_streams_params *params);
