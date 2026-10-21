@@ -1,0 +1,82 @@
+From a5cdde01f212766ac67b57a95c291412a35956fd Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Tue, 20 Oct 2026 22:25:02 +1100
+Subject: [PATCH] drm/amd/display: Keep the iMac companion's identity across
+ scaled resume
+
+After S3 from a scaled mode, 7003 replaces real companion detection with
+emulated detection. That releases the companion's real sink, creates a
+virtual one and reads EDID before the primary has re-armed the companion.
+The read fails, the connector keeps 640x480 fallback modes without TILE,
+and userspace can no longer return to native 5K.
+
+Inside 7003's scaled-mode branch only, keep the mapped companion's sink
+when it is the real, valid, published sink of an unforced SST pair. The
+resume loop then republishes the same EDID and TILE. Forced connectors,
+native mode and a companion with no real sink keep their existing paths.
+The sink survives suspend because the hold keeps it through the suspend
+commit's companion HPD-low.
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c   | 10 ++++++----
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c    | 13 +++++++++++++
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h    |  1 +
+ 3 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index d9307d8f804c3f51b5b6227d762c68cd5268d533..40e52ff5b04615587e6ae97c911fad5e6296ada2 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2089,11 +2089,13 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 		if (!dc_link_detect_connection_type(aconnector->dc_link, &new_connection_type))
+ 			drm_err(adev_to_drm(adev), "KMS: Failed to detect connector\n");
+ 
+-		if ((aconnector->base.force && new_connection_type == dc_connection_none)
+-				|| (dm->dc->config.imac5K_support &&
+-					!dm->dc->config.imac5K_using_5K &&
+-					aconnector->dc_link->link_index == 1)) {
++		if (aconnector->base.force && new_connection_type == dc_connection_none) {
+ 			amdgpu_dm_emulated_link_detect(aconnector->dc_link);
++		} else if (dm->dc->config.imac5K_support &&
++			   !dm->dc->config.imac5K_using_5K &&
++			   aconnector->dc_link->link_index == 1) {
++			if (!dm_imac5k_keep_companion(aconnector))
++				amdgpu_dm_emulated_link_detect(aconnector->dc_link);
+ 		} else {
+ 			guard(mutex)(&dm->dc_lock);
+ 			dc_exit_ips_for_hw_access(dm->dc);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+index b8ce288eebd43443665a0e6b9f9b6b844d7a4458..db44035f08fa5f51cbf2544ff5c9c4767cfd3aff 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+@@ -236,6 +236,19 @@ static bool companion_identity(struct amdgpu_dm_connector *aconnector)
+ 		published_sink(aconnector);
+ }
+ 
++/*
++ * Resume, hpd_lock held, in 7003's scaled-mode branch only. Emulation would
++ * read EDID before the primary is re-armed and replace the real sink with
++ * a virtual one; the board-fixed companion keeps its published identity.
++ */
++bool dm_imac5k_keep_companion(struct amdgpu_dm_connector *aconnector)
++{
++	if (!companion_identity(aconnector))
++		return false;
++	drm_info(aconnector->base.dev, "iMac 5K: keeping companion identity across scaled resume\n");
++	return true;
++}
++
+ /*
+  * hpd_lock held, before ordinary detection. While the pair is dark, the
+  * companion's HPD only follows the primary's D3 write: hold the published
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+index e1a5f962d5a66c8dbae18fc485c25314b6f1699b..20c477efc49742036cd46f78e5a87bb909900167 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+@@ -37,6 +37,7 @@ void dm_imac5k_cancel(struct amdgpu_display_manager *dm);
+ void dm_imac5k_capture(struct amdgpu_display_manager *dm);
+ void dm_imac5k_detected(struct amdgpu_dm_connector *aconnector, bool detected);
+ void dm_imac5k_queue(struct amdgpu_display_manager *dm, int restore_error);
++bool dm_imac5k_keep_companion(struct amdgpu_dm_connector *aconnector);
+ bool dm_imac5k_hold_hpd(struct amdgpu_dm_connector *aconnector);
+ void dm_imac5k_hold_commit(struct amdgpu_display_manager *dm,
+ 			   const struct dc_commit_streams_params *params);

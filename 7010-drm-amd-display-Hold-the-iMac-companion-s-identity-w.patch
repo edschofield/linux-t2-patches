@@ -1,0 +1,415 @@
+From d88f44bd79024eeb9808aeeeb32cad9f80a205df Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Tue, 20 Oct 2026 22:24:51 +1100
+Subject: [PATCH] drm/amd/display: Hold the iMac companion's identity while the
+ pair is dark
+
+Every primary D3 write clears the companion's enable register, so the
+companion drops HPD whenever the pair is blanked. Ordinary detection then
+publishes it as disconnected, and on wake as a new sink with a forced
+restore. Userspace re-lays out the panel twice for one blank: 7003 alone
+and V8 both publish the disconnect in every traced GNOME DPMS cycle.
+
+While neither pair link has a stream, keep the companion's published real
+sink instead of detecting, and consume its HPD changes. A commit that
+lights the dark primary queues one check a second later. With the
+primary still lit, the check confirms HPD, the identity and, if routed, an
+active link on the same sink; otherwise it runs ordinary detection once
+under the same hpd_lock. A check that finds the pair dark again keeps the
+hold for the next wake.
+
+The hold state is written under the companion's hpd_lock and then
+dc_lock, so the commit hook needs only dc_lock and takes no other lock.
+Split the ordinary HPD body out of handle_hpd_irq_helper() for the check.
+Close the hold after S3 drains HPD work, at the start of a GPU reset and
+at teardown, cancelling the check with no lock held; reopen it before
+HPD resumes. Primary-only DPMS and a lit companion are not held.
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |   9 +
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |   1 +
+ .../amd/display/amdgpu_dm/amdgpu_dm_imac5k.c  | 156 +++++++++++++++++-
+ .../amd/display/amdgpu_dm/amdgpu_dm_imac5k.h  |  17 ++
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c |  35 ++--
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_irq.h |   4 +
+ 6 files changed, 210 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index fd6333361869de9b6fb61f1df9c8c50e99ce3e83..d9307d8f804c3f51b5b6227d762c68cd5268d533 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -908,6 +908,7 @@ static void amdgpu_dm_fini(struct amdgpu_device *adev)
+ 	int i;
+ 
+ 	dm_imac5k_cancel(&adev->dm);
++	dm_imac5k_hold_close(&adev->dm);
+ 
+ 	if (adev->dm.vblank_control_workqueue) {
+ 		destroy_workqueue(adev->dm.vblank_control_workqueue);
+@@ -1633,6 +1634,9 @@ static int dm_suspend(struct amdgpu_ip_block *ip_block)
+ 	if (amdgpu_in_reset(adev)) {
+ 		enum dc_status res;
+ 
++		/* No hold check may run or wait inside the reset. */
++		dm_imac5k_hold_close(dm);
++
+ 		/* Quiesce ISM workers before taking dc_lock (workers take
+ 		 * dc_lock themselves; syncing under it would deadlock).
+ 		 */
+@@ -1684,6 +1688,8 @@ static int dm_suspend(struct amdgpu_ip_block *ip_block)
+ 	s3_handle_mst(adev_to_drm(adev), true);
+ 
+ 	amdgpu_dm_irq_suspend(adev);
++	/* HPD work is drained: drop any hold, including the suspend commit's. */
++	dm_imac5k_hold_close(dm);
+ 
+ 	/*
+ 	 * Quiesce ISM workers before taking dc_lock (workers take dc_lock
+@@ -2003,6 +2009,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 		amdgpu_dm_irq_resume_late(adev);
+ 
+ 		mutex_unlock(&dm->dc_lock);
++		dm_imac5k_hold_open(dm);
+ 
+ 		/* set the backlight after a reset */
+ 		for (i = 0; i < dm->num_of_edps; i++) {
+@@ -2144,6 +2151,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
+ 	 */
+ 	amdgpu_dm_dump_links_and_sinks(adev);
+ 
++	dm_imac5k_hold_open(dm);
+ 	amdgpu_dm_irq_resume_late(adev);
+ 	dm_imac5k_queue(dm, r);
+ 
+@@ -4704,6 +4712,7 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_commit *state,
+ 	dm_enable_per_frame_crtc_master_sync(dc_state);
+ 	mutex_lock(&dm->dc_lock);
+ 	dc_exit_ips_for_hw_access(dm->dc);
++	dm_imac5k_hold_commit(dm, &params);
+ 	WARN_ON(!dc_commit_streams(dm->dc, &params));
+ 
+ 	if (dm->imac5K_support) {
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 6e84d0886398e7fab824a6b6086d598b9d8466cf..8217b80c87e14e868894bc0add4b2886518e3294 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -608,6 +608,7 @@ struct amdgpu_display_manager {
+ 	struct idle_workqueue *idle_workqueue;
+ 
+ 	struct dm_imac5k_recovery imac5k_recovery;
++	struct dm_imac5k_hold imac5k_hold;
+ 	struct drm_atomic_commit *cached_state;
+ 	struct dc_state *cached_dc_state;
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+index c3c7d31c790a9f0e375f1ada7cba283e034dbb36..b8ce288eebd43443665a0e6b9f9b6b844d7a4458 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.c
+@@ -1,5 +1,8 @@
+ // SPDX-License-Identifier: MIT
+-/* Bounded resume recovery for the mapped iMac SST companion. */
++/*
++ * Bounded resume recovery for the mapped iMac SST companion, and the hold
++ * that keeps its identity while the pair is dark.
++ */
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_probe_helper.h>
+@@ -8,12 +11,16 @@
+ #include "amdgpu_dm.h"
+ #include "amdgpu_dm_connector.h"
+ #include "amdgpu_dm_hdcp.h"
++#include "amdgpu_dm_irq.h"
+ #include "dc.h"
+ #include "dc/dc_stream.h"
+ #include "dc/dc_dmub_srv.h"
++#include "dc/inc/core_types.h"
+ 
+ static const unsigned int recovery_delays_ms[] = { 500, 1000, 2000 };
+ 
++#define IMAC5K_HOLD_CHECK_MS	1000
++
+ static bool valid_sink(struct dc_link *link)
+ {
+ 	struct dc_sink *sink = link->local_sink;
+@@ -204,9 +211,156 @@ static void recovery_work(struct work_struct *work)
+ 		drm_kms_helper_connector_hotplug_event(&aconnector->base);
+ }
+ 
++/* dc_lock held: the link's stream in the state DC has programmed. */
++static struct dc_stream_state *pair_stream(struct dc *dc, struct dc_link *link)
++{
++	struct dc_state *state = dc->current_state;
++	unsigned int i;
++
++	for (i = 0; link && i < state->stream_count; i++)
++		if (state->streams[i]->link == link)
++			return state->streams[i];
++	return NULL;
++}
++
++/* hpd_lock held. An unforced SST pair whose companion published a real sink. */
++static bool companion_identity(struct amdgpu_dm_connector *aconnector)
++{
++	struct dc *dc = aconnector->dc_link->ctx->dc;
++	struct amdgpu_dm_connector *primary =
++		dc->imac5k_pair.primary ? dc->imac5k_pair.primary->priv : NULL;
++
++	return aconnector->dc_link == dc->imac5k_pair.companion && primary &&
++		aconnector->base.force == DRM_FORCE_UNSPECIFIED && !aconnector->mst_root &&
++		primary->base.force == DRM_FORCE_UNSPECIFIED && !primary->mst_root &&
++		published_sink(aconnector);
++}
++
++/*
++ * hpd_lock held, before ordinary detection. While the pair is dark, the
++ * companion's HPD only follows the primary's D3 write: hold the published
++ * identity instead of detecting. Return true if the event is consumed.
++ */
++bool dm_imac5k_hold_hpd(struct amdgpu_dm_connector *aconnector)
++{
++	struct drm_device *dev = aconnector->base.dev;
++	struct amdgpu_display_manager *dm = &drm_to_adev(dev)->dm;
++	struct dm_imac5k_hold *h = &dm->imac5k_hold;
++	struct dc *dc = aconnector->dc_link->ctx->dc;
++	bool hpd, lit;
++
++	if (aconnector->dc_link != dc->imac5k_pair.companion || h->closed)
++		return false;
++
++	guard(mutex)(&dm->dc_lock);
++	hpd = dc_link_get_hpd_state(aconnector->dc_link);
++	lit = pair_stream(dc, dc->imac5k_pair.primary) != NULL;
++	if (h->held) {
++		/* With the primary lit, the wake check decides. */
++		h->held = lit || !hpd;
++		if (!h->held)
++			drm_info(dev, "iMac 5K: companion HPD rose while the primary is dark\n");
++		return h->held;
++	}
++	if (hpd || lit || pair_stream(dc, aconnector->dc_link) ||
++	    !companion_identity(aconnector))
++		return false;
++	h->held = true;
++	drm_info(dev, "iMac 5K: holding companion identity while the pair is dark\n");
++	return true;
++}
++
++/* dc_lock held, before dc_commit_streams(): each wake gets its own check. */
++void dm_imac5k_hold_commit(struct amdgpu_display_manager *dm,
++			   const struct dc_commit_streams_params *params)
++{
++	struct dm_imac5k_hold *h = &dm->imac5k_hold;
++	struct dc_link *primary = dm->dc->imac5k_pair.primary;
++	unsigned int i;
++
++	if (h->closed || !h->held || pair_stream(dm->dc, primary))
++		return;
++	for (i = 0; i < params->stream_count; i++) {
++		if (params->streams[i]->link == primary) {
++			mod_delayed_work(system_percpu_wq, &h->work,
++					 msecs_to_jiffies(IMAC5K_HOLD_CHECK_MS));
++			return;
++		}
++	}
++}
++
++/*
++ * One check per wake. The companion's hpd_lock is held throughout, so no
++ * HPD callback runs between the decision and a fallback detection. Only
++ * the handler sets held, so the companion's connector exists.
++ */
++static void hold_work(struct work_struct *work)
++{
++	struct dm_imac5k_hold *h = container_of(to_delayed_work(work),
++						 struct dm_imac5k_hold, work);
++	struct amdgpu_display_manager *dm =
++		container_of(h, struct amdgpu_display_manager, imac5k_hold);
++	struct amdgpu_dm_connector *aconnector = dm->dc->imac5k_pair.companion->priv;
++	struct dc_link *link = aconnector->dc_link;
++	struct dc_stream_state *stream;
++	bool hpd = false, identity = false, routed = false, active = false;
++
++	guard(mutex)(&aconnector->hpd_lock);
++	scoped_guard(mutex, &dm->dc_lock) {
++		/* Dark again: keep holding; the next wake queues its own check. */
++		if (h->closed || !h->held || !pair_stream(dm->dc, dm->dc->imac5k_pair.primary))
++			return;
++		h->held = false;
++		hpd = dc_link_get_hpd_state(link);
++		identity = companion_identity(aconnector);
++		stream = pair_stream(dm->dc, link);
++		routed = stream != NULL;
++		active = stream && stream->sink == aconnector->dc_sink &&
++			link->link_status.link_active;
++	}
++	if (hpd && identity && (!routed || active)) {
++		drm_info(dm->ddev, "iMac 5K: companion hold released: routed=%d\n", routed);
++		return;
++	}
++	drm_warn(dm->ddev, "iMac 5K: companion not confirmed after wake: hpd=%d identity=%d routed=%d active=%d; detecting\n",
++		 hpd, identity, routed, active);
++	if (!dm->disable_hpd_irq)
++		amdgpu_dm_hpd_detect_locked(aconnector, DETECT_REASON_HPD);
++}
++
++/* Writers take the companion's hpd_lock, then dc_lock. */
++static void hold_admit(struct amdgpu_display_manager *dm, bool closed)
++{
++	struct dc_link *link = dm->dc ? dm->dc->imac5k_pair.companion : NULL;
++	struct amdgpu_dm_connector *aconnector = link ? link->priv : NULL;
++
++	/* Unmapped: nothing can be held. */
++	if (!aconnector) {
++		dm->imac5k_hold.closed = closed;
++		return;
++	}
++	guard(mutex)(&aconnector->hpd_lock);
++	guard(mutex)(&dm->dc_lock);
++	dm->imac5k_hold.closed = closed;
++	dm->imac5k_hold.held = false;
++}
++
++void dm_imac5k_hold_open(struct amdgpu_display_manager *dm)
++{
++	hold_admit(dm, false);
++}
++
++/* Drop any hold without detection, then drain the check with no lock held. */
++void dm_imac5k_hold_close(struct amdgpu_display_manager *dm)
++{
++	hold_admit(dm, true);
++	cancel_delayed_work_sync(&dm->imac5k_hold.work);
++}
++
+ void dm_imac5k_init(struct amdgpu_display_manager *dm)
+ {
+ 	INIT_DELAYED_WORK(&dm->imac5k_recovery.work, recovery_work);
++	INIT_DELAYED_WORK(&dm->imac5k_hold.work, hold_work);
+ }
+ 
+ void dm_imac5k_cancel(struct amdgpu_display_manager *dm)
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+index f57ceb5c8259c0148daf2a5962e856dd29640e14..e1a5f962d5a66c8dbae18fc485c25314b6f1699b 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_imac5k.h
+@@ -6,6 +6,7 @@
+ 
+ struct amdgpu_display_manager;
+ struct amdgpu_dm_connector;
++struct dc_commit_streams_params;
+ struct dc_sink;
+ 
+ /* Resume owns both connector references until synchronous cancellation. */
+@@ -20,10 +21,26 @@ struct dm_imac5k_recovery {
+ 	bool notify_pending;
+ };
+ 
++/*
++ * The companion's published identity, held while the pair is dark. closed
++ * and held are written under the companion's hpd_lock and then dc_lock;
++ * either lock alone is enough to read them.
++ */
++struct dm_imac5k_hold {
++	struct delayed_work work;
++	bool closed;
++	bool held;
++};
++
+ void dm_imac5k_init(struct amdgpu_display_manager *dm);
+ void dm_imac5k_cancel(struct amdgpu_display_manager *dm);
+ void dm_imac5k_capture(struct amdgpu_display_manager *dm);
+ void dm_imac5k_detected(struct amdgpu_dm_connector *aconnector, bool detected);
+ void dm_imac5k_queue(struct amdgpu_display_manager *dm, int restore_error);
++bool dm_imac5k_hold_hpd(struct amdgpu_dm_connector *aconnector);
++void dm_imac5k_hold_commit(struct amdgpu_display_manager *dm,
++			   const struct dc_commit_streams_params *params);
++void dm_imac5k_hold_open(struct amdgpu_display_manager *dm);
++void dm_imac5k_hold_close(struct amdgpu_display_manager *dm);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c
+index 74a8735168aaa537aaed6915ba265422778417f1..b8247c990a8153cebe83d9bf9be290e5f91c8731 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c
+@@ -1345,8 +1345,9 @@ void amdgpu_dm_hdmi_hpd_debounce_work(struct work_struct *work)
+ }
+ EXPORT_IF_KUNIT(amdgpu_dm_hdmi_hpd_debounce_work);
+ 
+-STATIC_IFN_KUNIT void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector,
+-				  enum dc_detect_reason reason)
++/* Ordinary long-pulse handling. The caller holds aconnector->hpd_lock. */
++void amdgpu_dm_hpd_detect_locked(struct amdgpu_dm_connector *aconnector,
++				 enum dc_detect_reason reason)
+ {
+ 	struct drm_connector *connector = &aconnector->base;
+ 	struct drm_device *dev = connector->dev;
+@@ -1357,15 +1358,6 @@ STATIC_IFN_KUNIT void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnect
+ 	bool ret = false;
+ 	bool debounce_required = false;
+ 
+-	if (adev->dm.disable_hpd_irq)
+-		return;
+-
+-	/*
+-	 * In case of failure or MST no need to update connector status or notify the OS
+-	 * since (for MST case) MST does this in its own context.
+-	 */
+-	guard(mutex)(&aconnector->hpd_lock);
+-
+ 	if (adev->dm.hdcp_workqueue) {
+ 		hdcp_reset_display(adev->dm.hdcp_workqueue, aconnector->dc_link->link_index);
+ 		dm_con_state->update_hdcp = true;
+@@ -1443,6 +1435,27 @@ STATIC_IFN_KUNIT void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnect
+ 		}
+ 	}
+ }
++
++STATIC_IFN_KUNIT void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector,
++				  enum dc_detect_reason reason)
++{
++	struct amdgpu_device *adev = drm_to_adev(aconnector->base.dev);
++
++	if (adev->dm.disable_hpd_irq)
++		return;
++
++	/*
++	 * In case of failure or MST no need to update connector status or notify the OS
++	 * since (for MST case) MST does this in its own context.
++	 */
++	guard(mutex)(&aconnector->hpd_lock);
++
++	/* A held iMac companion is resolved by its wake check instead. */
++	if (dm_imac5k_hold_hpd(aconnector))
++		return;
++
++	amdgpu_dm_hpd_detect_locked(aconnector, reason);
++}
+ EXPORT_IF_KUNIT(handle_hpd_irq_helper);
+ 
+ STATIC_IFN_KUNIT void handle_hpd_irq(void *param)
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.h
+index bc16ecc67329c4bb7b1aee64f1ae15d0c7ffa3a0..2772adcf8ebe61b581935819bbe95a1c8c55e6ce 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.h
+@@ -30,10 +30,12 @@
+ struct amdgpu_device;
+ struct amdgpu_crtc;
+ struct amdgpu_display_manager;
++struct amdgpu_dm_connector;
+ struct dc_sink;
+ struct hpd_rx_irq_offload_work_queue;
+ struct work_struct;
+ enum dmub_notification_type;
++enum dc_detect_reason;
+ 
+ /*
+  * Display Manager IRQ-related interfaces (for use by DAL).
+@@ -142,6 +144,8 @@ struct hpd_rx_irq_offload_work_queue *amdgpu_dm_hpd_rx_irq_create_workqueue(stru
+ void amdgpu_dm_hpd_rx_irq_work_suspend(struct amdgpu_display_manager *dm);
+ int amdgpu_dm_register_hpd_handlers(struct amdgpu_device *adev);
+ void amdgpu_dm_hdmi_hpd_debounce_work(struct work_struct *work);
++void amdgpu_dm_hpd_detect_locked(struct amdgpu_dm_connector *aconnector,
++				 enum dc_detect_reason reason);
+ 
+ /* IRQ handlers */
+ struct amdgpu_crtc *amdgpu_dm_get_crtc_by_otg_inst(struct amdgpu_device *adev,
