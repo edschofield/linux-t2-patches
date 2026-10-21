@@ -1,0 +1,61 @@
+From da76349f95da474043e3a993d6c620c81ef2b523 Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Wed, 21 Oct 2026 18:35:48 +1100
+Subject: [PATCH] drm/amd/display: Wait for the iMac 5K right tile at boot
+ detection
+
+Boot detection reaches the right tile (link 1) a few milliseconds after
+the left tile's detection has set 0x4F1, but the right tile's HPD rises
+only 73-83 ms after that write. HPD interrupts are not yet enabled, so
+nothing reports the rise, and the right tile is first detected seconds
+later, after the first commit has powered the left tile down and up
+again. By then the fbdev console has sized its framebuffer for the left
+tile alone. Its later probes cannot grow the framebuffer, so they prune
+both tiles' 2560x2880 modes and leave the right tile with only the
+DisplayPort fail-safe mode.
+
+Before boot detection of the right tile, wait up to 150 ms for its HPD
+and a successful DPCD read, as before training it. Its EDID is then read
+while the driver loads, and the sink is kept from then on. If the right
+tile is still not ready, warn and leave it undetected; a later HPD edge
+detects it as before.
+---
+ .../drm/amd/display/dc/link/link_detection.c  | 22 +++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+index 36c8f1eec..e69ea4c83 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+@@ -1637,6 +1637,28 @@ bool link_detect(struct dc_link *link, enum dc_detect_reason reason)
+ 	if (link->local_sink && dc_sink_is_kept_imac5k_tile(link->local_sink))
+ 		return false;
+ 
++	/*
++	 * iMac 5K: boot detection reaches the right tile just after the left
++	 * tile's detection has set 0x4F1, before the right tile's HPD rises,
++	 * and no interrupt reports the rise. Wait for its HPD and a DPCD read,
++	 * or leave it undetected.
++	 */
++	if (reason == DETECT_REASON_BOOT && link->dc->config.imac5K_support &&
++	    link->link_index == 1) {
++		unsigned long long start = dm_get_timestamp(link->ctx);
++		uint8_t rev;
++
++		while (!link_get_hpd_state(link) ||
++		       core_link_read_dpcd(link, DP_DPCD_REV, &rev, 1) != DC_OK) {
++			if (dm_get_elapse_time_in_ns(link->ctx, dm_get_timestamp(link->ctx),
++						     start) > 150 * NSEC_PER_MSEC) {
++				DC_LOG_WARNING("iMac 5K: right tile not ready at boot\n");
++				return false;
++			}
++			fsleep(1000);
++		}
++	}
++
+ 	is_local_sink_detect_success = detect_link_and_local_sink(link, reason);
+ 
+ 	if (is_local_sink_detect_success && link->local_sink) {
+-- 
+2.54.0 (Apple Git-157)
+
