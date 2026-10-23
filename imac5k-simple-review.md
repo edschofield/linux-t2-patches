@@ -1,24 +1,17 @@
-# iMac 5K: Simple V2 and Simple V3 for review
+# iMac 5K: Simple V5 for review
 
-These are Simple V2 and Simple V3, offered for review while hardware
-validation continues. They follow
-[Atharva's request for a smaller patch set](https://github.com/t2linux/wiki/issues/743#issuecomment-6290452376).
-V2 has five patches, adding 105 lines and removing 15. V3 adds a sixth
-patch: a 22-line wait before detecting the right tile at boot. Both change
-eight existing kernel files, with no new kernel files or recovery worker.
+Simple V5 is the small patch set
+[Atharva asked for](https://github.com/t2linux/wiki/issues/743#issuecomment-6290452376),
+now tested with and without an external display on one iMac20,1 /
+Radeon Pro 5300. It has seven patches on top of 7003, adding 129 lines and
+removing 16 in eight existing kernel files. There are no new files and no
+recovery worker. The first six patches are Simple V3 unchanged. The
+seventh is a two-line change that fixes the one failure V3's watched tests
+found.
 
-The version names are Simple V1, Simple V2 and Simple V3. Simple V1 was
-the initial source version (`4086e5724`). Simple V2 added the EDID restore
-after a forced connector probe. Simple V3 adds the boot wait. The source
-and release table below retains the original build identifiers so the
-versions can be matched to their test logs.
-
-- [V2: five patches](https://github.com/edschofield/linux-t2-patches/tree/draft/imac5k-simple-v2)
+- [V5: seven patches](https://github.com/edschofield/linux-t2-patches/tree/draft/imac5k-simple-v5)
+- [V3 to V5 comparison](https://github.com/edschofield/linux-t2-patches/compare/draft/imac5k-simple-v3...draft/imac5k-simple-v5)
 - [V3: six patches](https://github.com/edschofield/linux-t2-patches/tree/draft/imac5k-simple-v3)
-- [V2 to V3 comparison](https://github.com/edschofield/linux-t2-patches/compare/draft/imac5k-simple-v2...draft/imac5k-simple-v3)
-
-The first five patch files and this note are identical on both branches.
-The comparison contains only the added boot-wait patch, `7009`.
 
 | Patch | Change |
 | --- | --- |
@@ -27,60 +20,106 @@ The comparison contains only the added boot-wait patch, `7009`.
 | 7006 | Keep the right tile's sink across power-downs, restore its published EDID after a forced probe, and wait for readiness before training. |
 | 7007 | Ignore the right tile's idle lane bits while still failing an unsuccessful AUX read. |
 | 7008 | Restart an unchanged right tile when the left tile restarts. |
-| 7009, V3 only | Wait for right-tile HPD and a successful DPCD read before boot detection, with a 150 ms timeout. |
+| 7009 | Wait for right-tile HPD and a successful DPCD read before boot detection, with a 150 ms timeout. |
+| 7010, new in V5 | Don't attach `max bpc` to the two internal tiles, so both stay at the EDID's 10 bpc. |
 
-V2 already includes the D0 re-arm and primary-first ordering. Both versions
-keep Atharva's detection-time and atomic-tail `0x4F1` writes. Patch 7009
-adds no register write.
+All seven keep Atharva's detection-time and atomic-tail `0x4F1` writes and
+his iMac20,1/20,2 scope.
 
-The comparison was tested on one iMac20,1 / Radeon Pro 5300 with an LED
-Cinema Display attached. In V2, DP-1's EDID arrived after fbcon had chosen
-a framebuffer for eDP-1 alone. Later fbdev probes use the existing
-framebuffer's dimensions, so they rejected the 2880-line tile modes.
-The correct EDID eventually arrived, but the console stayed at 3840x2160
-with DP-1 disabled throughout the two-minute passive observation.
+## Why 7010
 
-The saved DRM-debug boot logs from 21 October 2026 show:
+In V3's watched test, the right half of the panel went blank after the
+first `max bpc` change and came back at the next one. Every automated check
+passed: both streams were enabled, scanning out, flipping and trained. A
+controlled sequence showed the image loss follows unequal tile depths. With
+the left tile at 8 bpc and the right at 10, only the left half showed. At
+8/8 and 10/10 both halves showed, and restarting either tile alone at 10/10
+kept or restored both. Each tile has its own `max bpc` property, and a
+change on one tile restarts only that tile's stream, so a single property
+change reaches the bad state.
 
-| Event, seconds after boot | V2 | V3 |
+7010 leaves the property off both internal tiles. They then always run at
+the EDID depth of 10 bpc, which is the default and the state in which every
+check passed. External connectors, including the Cinema's, keep the
+property. The cost is that the internal panel can no longer be set to
+8 bpc. `max bpc` is optional, and GNOME started normally without it.
+
+## What was tested
+
+All of this is from one iMac20,1, with the Apple LED Cinema Display
+attached through its hub and without it.
+
+- **Unattended, 22 October:** 72 judged stages and ten trial boots, with
+  both cablings and both images (production and a diagnostic build with
+  extra logging and fault injection). That covers boots, DPMS ×10, native
+  S3 ×10, blank-then-S3, scaled S3 at 2560x1440 and 3840x2160, both CRTC
+  assignments, dependent restarts, the idle-check control and five injected
+  faults. Every capture and held-state snapshot reported 10/10 bpc, and
+  neither internal tile had `max bpc` wherever properties were read. DP-1 kept its 256-byte EDID and TILE through every dark period,
+  with no DP-1 hotplug event.
+- **Watched, 22–23 October:** cold starts, GNOME, DPMS, S3, blank-then-S3,
+  scaled S3 and console handover all looked right with both cablings. The
+  check that failed V3 now passes. Both halves came back after every
+  operation, in both CRTC assignments, with and without the Cinema. A
+  left-tile-only `Colorspace` change also kept both halves.
+
+## Known limits
+
+- **Brief blink when the right tile alone turns off or on.** The whole
+  panel goes dark for a fraction of a second at each transition. The left
+  tile isn't restarted, but its flips stall for 117–167 ms at both
+  transitions. V3's runs show the same stall. I've accepted this; the cause
+  isn't known.
+- **Console drawing on the Cinema stalls the iMac's flips.** While the
+  console's blinking cursor or `htop` draws on the Cinema, the moving-seam
+  test shows late frames on the internal panel. This happens on V5 and on
+  the 7.2.10 kernel I use daily alike; the daily kernel had more late
+  frames. V5 also showed occasional one-frame offsets between the two
+  tiles, as earlier 7.3 builds did. With the cursor hidden, V5 had no late
+  frame or offset in either CRTC assignment. Under GNOME the console
+  doesn't draw on the Cinema, so this isn't a desktop case, but the cause
+  isn't known.
+- **A USB error on one Cinema hub replug** (`usb 4-1: Failed to suspend
+  device, error -19`, 19 µs after the hub dropped off during insertion).
+  The display recovered normally. It happened once and wasn't retested.
+- **A forced readiness timeout trains for about 2.3 s under `dc_lock`**
+  before giving up. This was seen only with an injected fault; in V3's
+  records, ordinary readiness waits took 0.8 to 53 ms.
+- No iMac20,2 results; colour depth on the wire isn't measured; no daily
+  use yet.
+
+## Boot detection (7009, from V3)
+
+Without 7009, DP-1's EDID arrived after fbcon had sized its framebuffer
+for eDP-1 alone. Later fbdev probes kept that size, rejected the
+2880-line tile modes and left the console at 3840x2160 with DP-1 disabled.
+The DRM-debug boot logs from 21 October show:
+
+| Event, seconds after boot | Without 7009 | With 7009 |
 | --- | --- | --- |
 | DP-1 boot detection | No sink at 5.461 s | Sink published at 5.748 s |
 | First DP-1 EDID update | 9.811 s | 5.662 s |
 | fbdev framebuffer allocation | 3840x2160 at 7.717 s | 5120x2880 at 8.000 s |
 | Later probe | Both tiles' 2560x2880 modes rejected with `VIRTUAL_Y`; DP-1 left with 640x480 | Both tiles have 2560x2880 modes |
 
-All 14 recorded V3 boots passed the native-tile state checks: nine used
-the production image, including one with DRM debug logging, and five used
-the separate diagnostic image. Each had both tiles at 2560x2880 on separate
-CRTCs and DP-1's 256-byte EDID. The five diagnostic boots measured waits of
-43,279 to 53,322 microseconds. The boot checks did not verify the visible
-image. These results support acquiring DP-1 before the console's first
-mode selection; they do not prove that every patch is individually necessary.
+The diagnostic boots measured waits of 43 to 53 ms.
 
-R3's unattended S3 and DPMS checks with the Cinema passed their state and
-log gates. Attended visual checks, cold starts and tests without the Cinema
-remain pending in this record. A reversed-CRTC seam run recorded three
-one-frame tile offsets in 40 seconds. A forced readiness timeout also
-showed training continuing under `dc_lock` for 2.29 seconds; failing the
-enable immediately on timeout remains a possible follow-up. This series
-is not yet a validated complete fix. It retains Atharva's iMac20,1/20,2
-scope, but has no iMac20,2 test results.
+## Source
 
 The hardware-tested source uses Linux 7.3, Atharva's full 5K attachment and
-the project's pinned T2 prerequisites. The exact source commits are:
+the project's pinned T2 prerequisites:
 
 | Version | Tested source commit | Kernel release |
 | --- | --- | --- |
 | Base | `000f24044eacaf78ea65c62f7ef73c79a33a09b8` | `7.3.0-imac-atfix7` |
-| V2 | `8404bf6e8c29280d3248bad379f97d8b1c893f55` | `7.3.0-imac-hpd73-simple-v1` |
 | V3 | `da76349f95da474043e3a993d6c620c81ef2b523` | `7.3.0-imac-hpd73-simple-v1-r3` |
+| V5 | `73ca170aaca64dda9c4b602364a94fc3d0b24cd9` | `7.3.0-imac-hpd73-simple-v5` |
 
-These review branches start at t2linux patch-repository commit
-`e6965b4babc6c73383143c989b555b151fcfbc46` (Linux 7.3). Applying its
-patches and the review exports to v7.3 reproduces each tested
-`drivers/gpu/drm/amd` subtree exactly. Other T2 drivers differ from the
-hardware-tested base; this full combination has not been boot-tested.
-The exported patches preserve the tested code and descriptions, with
-`7004`-`7009` filenames and unnumbered mail subjects so the shared files
-remain identical. They are unsigned review drafts, not a signed-off
-submission. Claude and Codex assisted with the code and analysis.
+This branch starts at t2linux patch-repository commit
+`e6965b4babc6c73383143c989b555b151fcfbc46` (Linux 7.3). Applying all 39 of
+its patches to v7.3 reproduces the tested V5 `drivers/gpu/drm/amd` subtree
+exactly. Other T2 drivers differ from the hardware-tested base, and this
+full combination hasn't been boot-tested. `7004`–`7009` are byte-identical
+to the V3 branch, and all seven patches have the same `git patch-id` as
+the tested commits. They're unsigned review drafts, not a signed-off
+submission. Claude and Codex helped with the code, testing and analysis.
