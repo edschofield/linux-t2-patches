@@ -1,0 +1,781 @@
+From 26d2cbaf50b137a88b04743d219030cbd2a29057 Mon Sep 17 00:00:00 2001
+From: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
+Date: Wed, 28 Oct 2026 16:44:37 +1100
+Subject: [PATCH] drm/amdgpu: Add support for the iMac 5K panel
+
+The internal 5120x2880 panel of the iMac20,1 and iMac20,2 is driven as
+two 2560x2880 tiles: the left by eDP on link 0 and the right by DP on
+link 1. Each tile has its own connector, grouped by the TILE property.
+The right tile's receiver, HPD and AUX respond only while the left
+tile's receiver is powered and its Apple-specific, undocumented DPCD
+register 0x4F1 is 1, so without a write to it the right tile is never
+detected. Every DP_SET_POWER D3 write to the left tile clears the
+register (36 of 36 traced writes across boot, DPMS and S3).
+
+Match both models by DMI and, on them only:
+
+- Add the display IP blocks before the SMU. Without this, SMU
+  initialisation timed out on 13 of 20 warm boots of an iMac20,1; an
+  iMac20,2 failed 9 of 20 without it and 0 of 100 with it. Why the order
+  matters is not known.
+
+- Set 0x4F1 when the left tile is detected, and again after every D0
+  write to its receiver, so that the right tile can be detected and
+  trained. At boot the right tile's HPD rises 73-83 ms after this write.
+
+- Before the right tile's boot detection and before training it, wait
+  up to 150 ms for its HPD and a successful DPCD read. Boot detection
+  otherwise reaches it before its HPD rises, while HPD interrupts are
+  still disabled. It was then found seconds later, after fbcon had sized
+  the console for the left tile alone and pruned both tiles' native
+  modes. If the receiver is still not ready, boot detection leaves the
+  tile for a later HPD edge, and training goes ahead as before.
+
+- Enable the left tile's master pipe before the right tile's. With the
+  right tile's CRTC on the lower pipe, its training failed on AUX; it
+  trained once the left tile was up.
+
+- Keep the right tile's sink once its EDID includes the extension block
+  with the tile data, as DC does for eDP, and have link_detect() return
+  early for it. Its HPD follows the left tile's power state, not a
+  cable, so otherwise DPMS publishes DP-1 as disconnected, S3 resume
+  misses the HPD rise, and resume in a scaled mode reads a 640x480 EDID
+  while 0x4F1 is clear. Forcing the connector off, or on while the panel
+  is dark, clears its published EDID; restore it from the kept sink when
+  modes are next probed. Writing 0 to the connector's debugfs
+  trigger_hotplug still releases the sink.
+
+- After training the right tile, ignore its lane status during the idle
+  pattern, but still treat a failed read as link loss. The idle check
+  reported lane loss in 103 of 189 attempts on lanes that were aligned
+  once video flowed. skip_fallback_on_link_loss is not used because it
+  also relaxes the equalisation check and live link-loss handling.
+
+- When the left tile's link is (re)enabled, clear the right tile's
+  link_state_valid so that its unchanged stream restarts after the left.
+  A "max bpc" or "Colorspace" change on the left tile alone, or blanking
+  only the left CRTC, otherwise restarted the left link and lost the
+  right tile's link with nothing to retrain it.
+
+- Do not attach "max bpc" to either tile. With the left stream at 8 bpc
+  and the right at 10 bpc, the right half of the panel lost its image
+  although both links stayed trained; at 8/8 and 10/10 bpc both halves
+  show. Both tiles then take their depth from the EDID.
+
+- When a non-native mode on the left tile falls back to scaling, use
+  RMX_FULL instead of RMX_ASPECT. A scaled mode drives the whole panel
+  through the left tile's 2560x2880 timing, which RMX_ASPECT would
+  letterbox.
+
+Only the iMac20,1 has been tested with these changes. The GPU-reset path
+is untested: a GPU reset hangs this iMac without this patch too.
+
+Co-developed-by: Ed Schofield <ed@aicharmers.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c |  37 +++-
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |   2 +
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |   9 +
+ .../display/amdgpu_dm/amdgpu_dm_connector.c   |  23 ++-
+ .../amd/display/amdgpu_dm/amdgpu_dm_quirks.c  |  29 +++-
+ .../tests/amdgpu_dm_connector_test.c          | 162 +++++++++++++++++-
+ drivers/gpu/drm/amd/display/dc/dc.h           |  28 +++
+ .../amd/display/dc/hwss/dce110/dce110_hwseq.c |  44 ++++-
+ .../drm/amd/display/dc/link/link_detection.c  |  22 +++
+ .../gpu/drm/amd/display/dc/link/link_dpms.c   |  30 ++++
+ .../gpu/drm/amd/display/dc/link/link_dpms.h   |   1 +
+ .../display/dc/link/protocols/link_dp_phy.c   |   7 +
+ .../dc/link/protocols/link_dp_training.c      |  10 +-
+ 13 files changed, 392 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
+index 7ab2ad2c5..8104dae39 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
+@@ -21,6 +21,7 @@
+  *
+  */
+ 
++#include <linux/dmi.h>
+ #include <linux/firmware.h>
+ #include <linux/kernfs.h>
+ 
+@@ -3082,8 +3083,25 @@ static int amdgpu_discovery_set_isp_ip_blocks(struct amdgpu_device *adev)
+ 	return 0;
+ }
+ 
++static const struct dmi_system_id amdgpu_discovery_imac5k_table[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Apple Inc."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "iMac20,1"),
++		},
++	},
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Apple Inc."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "iMac20,2"),
++		},
++	},
++	{}
++};
++
+ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
+ {
++	bool display_first;
+ 	int r;
+ 
+ 	switch (adev->asic_type) {
+@@ -3679,15 +3697,28 @@ int amdgpu_discovery_set_ip_blocks(struct amdgpu_device *adev)
+ 		}
+ 	}
+ 
++	/*
++	 * iMac 5K: SMU initialisation times out on some warm boots unless
++	 * the display blocks are added before the SMU. The cause is unknown.
++	 */
++	display_first = dmi_check_system(amdgpu_discovery_imac5k_table);
++	if (display_first) {
++		r = amdgpu_discovery_set_display_ip_blocks(adev);
++		if (r)
++			return r;
++	}
++
+ 	if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP)) {
+ 		r = amdgpu_discovery_set_smu_ip_blocks(adev);
+ 		if (r)
+ 			return r;
+ 	}
+ 
+-	r = amdgpu_discovery_set_display_ip_blocks(adev);
+-	if (r)
+-		return r;
++	if (!display_first) {
++		r = amdgpu_discovery_set_display_ip_blocks(adev);
++		if (r)
++			return r;
++	}
+ 
+ 	r = amdgpu_discovery_set_gc_ip_blocks(adev);
+ 	if (r)
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 47a0ff2ed..697139376 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -617,6 +617,8 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
+ 	retrieve_dmi_info(&adev->dm);
+ 	if (adev->dm.edp0_on_dp1_quirk)
+ 		init_data.flags.support_edp0_on_dp1 = true;
++	if (adev->dm.imac5k_support)
++		init_data.flags.imac5k_support = true;
+ 
+ 	if (adev->dm.bb_from_dmub)
+ 		init_data.bb_from_dmub = adev->dm.bb_from_dmub;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 881c8d1c3..ce6cfdbd5 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -689,6 +689,15 @@ struct amdgpu_display_manager {
+ 	 */
+ 	bool edp0_on_dp1_quirk;
+ 
++	/**
++	 * @imac5k_support:
++	 *
++	 * Quirk for the iMac 5K (iMac20,1 and iMac20,2), whose internal panel
++	 * is driven as two tiles: the left by eDP on link 0, the right by DP
++	 * on link 1.
++	 */
++	bool imac5k_support;
++
+ 	/**
+ 	 * @dpia_aux_lock:
+ 	 *
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+index 45a69bf43..4dc46866d 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+@@ -123,7 +123,10 @@ STATIC_IFN_KUNIT int dm_encoder_helper_atomic_check(struct drm_encoder *encoder,
+ 				       "mode %dx%d@%dHz is not native, enabling scaling\n",
+ 				       adjusted_mode->hdisplay, adjusted_mode->vdisplay,
+ 				       drm_mode_vrefresh(adjusted_mode));
+-			dm_new_connector_state->scaling = RMX_ASPECT;
++			/* iMac 5K: fill the panel rather than letterbox in the tile. */
++			dm_new_connector_state->scaling =
++				aconnector->dc_link->dc->config.imac5k_support ?
++				RMX_FULL : RMX_ASPECT;
+ 		}
+ 		return 0;
+ 	}
+@@ -3118,9 +3121,24 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
+ 	const struct drm_edid *drm_edid = amdgpu_dm_connector->drm_edid;
+ 	struct dc_link_settings *verified_link_cap = &dc_link->verified_link_cap;
+ 	const struct dc *dc = dc_link->dc;
++	struct dc_sink *sink = amdgpu_dm_connector->dc_sink;
+ 
+ 	encoder = amdgpu_dm_connector_to_encoder(connector);
+ 
++	/*
++	 * iMac 5K: forcing the right tile's connector off, or on while the
++	 * panel is dark, clears its published EDID. No detection publishes a
++	 * kept sink again, so restore the EDID from the sink.
++	 */
++	if (dc_link_is_imac5k_right_tile(dc_link) && sink &&
++	    dc_sink_is_kept_imac5k_tile(sink) && !connector->edid_blob_ptr) {
++		const struct drm_edid *kept = drm_edid_alloc(sink->dc_edid.raw_edid,
++							     sink->dc_edid.length);
++
++		drm_edid_connector_update(connector, kept);
++		drm_edid_free(kept);
++	}
++
+ 	if (!drm_edid) {
+ 		amdgpu_dm_connector->num_modes =
+ 				drm_add_modes_noedid(connector, 640, 480);
+@@ -3289,7 +3307,8 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
+ 				adev->mode_info.underscan_vborder_property,
+ 				0);
+ 
+-	if (!aconnector->mst_root)
++	/* iMac 5K: unequal tile depths lose the right tile's image; no per-tile cap. */
++	if (!aconnector->mst_root && !(dm->imac5k_support && link_index <= 1))
+ 		drm_connector_attach_max_bpc_property(&aconnector->base, 8, 16);
+ 
+ 	aconnector->base.state->max_bpc = 16;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
+index 259966703..d0b2562c8 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
+@@ -33,11 +33,13 @@
+ struct amdgpu_dm_quirks {
+ 	bool aux_hpd_discon;
+ 	bool support_edp0_on_dp1;
++	bool imac5k_support;
+ };
+ 
+ static struct amdgpu_dm_quirks quirk_entries = {
+ 	.aux_hpd_discon = false,
+-	.support_edp0_on_dp1 = false
++	.support_edp0_on_dp1 = false,
++	.imac5k_support = false,
+ };
+ 
+ static int edp0_on_dp1_callback(const struct dmi_system_id *id)
+@@ -52,6 +54,12 @@ static int aux_hpd_discon_callback(const struct dmi_system_id *id)
+ 	return 0;
+ }
+ 
++static int imac5k_support_callback(const struct dmi_system_id *id)
++{
++	quirk_entries.imac5k_support = true;
++	return 0;
++}
++
+ static const struct dmi_system_id dmi_quirk_table[] = {
+ 	{
+ 		.callback = aux_hpd_discon_callback,
+@@ -151,6 +159,20 @@ static const struct dmi_system_id dmi_quirk_table[] = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "HP ProBook 465 16 inch G11 Notebook PC"),
+ 		},
+ 	},
++	{
++		.callback = imac5k_support_callback,
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Apple Inc."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "iMac20,1"),
++		},
++	},
++	{
++		.callback = imac5k_support_callback,
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Apple Inc."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "iMac20,2"),
++		},
++	},
+ 	{}
+ 	/* TODO: refactor this from a fixed table to a dynamic option */
+ };
+@@ -162,6 +184,7 @@ void retrieve_dmi_info(struct amdgpu_display_manager *dm)
+ 
+ 	dm->aux_hpd_discon_quirk = false;
+ 	dm->edp0_on_dp1_quirk = false;
++	dm->imac5k_support = false;
+ 
+ 	dmi_id = dmi_check_system(dmi_quirk_table);
+ 
+@@ -176,6 +199,10 @@ void retrieve_dmi_info(struct amdgpu_display_manager *dm)
+ 		dm->edp0_on_dp1_quirk = true;
+ 		drm_info(dev, "support_edp0_on_dp1 attached\n");
+ 	}
++	if (quirk_entries.imac5k_support) {
++		dm->imac5k_support = true;
++		drm_info(dev, "imac5k_support attached\n");
++	}
+ }
+ EXPORT_IF_KUNIT(retrieve_dmi_info);
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/tests/amdgpu_dm_connector_test.c b/drivers/gpu/drm/amd/display/amdgpu_dm/tests/amdgpu_dm_connector_test.c
+index b61771749..7f60625ff 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/tests/amdgpu_dm_connector_test.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/tests/amdgpu_dm_connector_test.c
+@@ -4473,7 +4473,8 @@ static void dm_test_encoder_disable_noop(struct kunit *test)
+  * dm_encoder_helper_atomic_check() reads back through to_amdgpu_encoder(),
+  * to_amdgpu_dm_connector() and to_dm_connector_state(), so the encoder,
+  * connector and connector-state are stacked in their containers and wired
+- * together through conn_state->connector.
++ * together through conn_state->connector. The connector has a dc_link whose
++ * dc has every config flag clear, as on a board without quirks.
+  */
+ struct dm_test_atomic_check_ctx {
+ 	struct drm_device *drm;
+@@ -4481,6 +4482,7 @@ struct dm_test_atomic_check_ctx {
+ 	struct amdgpu_dm_connector *aconnector;
+ 	struct dm_connector_state *dm_state;
+ 	struct drm_crtc_state *crtc_state;
++	struct dc *dc;
+ };
+ 
+ static struct dm_test_atomic_check_ctx *
+@@ -4501,6 +4503,13 @@ dm_test_atomic_check_ctx_alloc(struct kunit *test, int connector_type)
+ 	KUNIT_ASSERT_NOT_NULL(test, ctx->aconnector);
+ 	ctx->aconnector->base.connector_type = connector_type;
+ 
++	ctx->dc = kunit_kzalloc(test, sizeof(*ctx->dc), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ctx->dc);
++	ctx->aconnector->dc_link = kunit_kzalloc(test, sizeof(*ctx->aconnector->dc_link),
++						 GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ctx->aconnector->dc_link);
++	ctx->aconnector->dc_link->dc = ctx->dc;
++
+ 	ctx->dm_state = kunit_kzalloc(test, sizeof(*ctx->dm_state), GFP_KERNEL);
+ 	KUNIT_ASSERT_NOT_NULL(test, ctx->dm_state);
+ 	ctx->dm_state->base.connector = &ctx->aconnector->base;
+@@ -4561,6 +4570,59 @@ static void dm_test_atomic_check_lvds_non_native_enables_scaling(struct kunit *t
+ 	KUNIT_EXPECT_EQ(test, (int)ctx->dm_state->scaling, (int)RMX_ASPECT);
+ }
+ 
++/**
++ * dm_test_atomic_check_imac5k_non_native_fills_panel - Test iMac 5K scaled modes fill the panel
++ * @test: The KUnit test context
++ *
++ * On the iMac 5K, a non-native mode on the left tile's eDP drives the whole
++ * panel from one 2560x2880 tile timing, so the fallback selects RMX_FULL
++ * rather than letterboxing with RMX_ASPECT.
++ */
++static void dm_test_atomic_check_imac5k_non_native_fills_panel(struct kunit *test)
++{
++	struct dm_test_atomic_check_ctx *ctx =
++		dm_test_atomic_check_ctx_alloc(test, DRM_MODE_CONNECTOR_eDP);
++
++	ctx->dc->config.imac5k_support = true;
++	ctx->aenc->native_mode.hdisplay = 2560;
++	ctx->aenc->native_mode.vdisplay = 2880;
++	ctx->crtc_state->adjusted_mode.hdisplay = 2560;
++	ctx->crtc_state->adjusted_mode.vdisplay = 1440;
++	ctx->dm_state->scaling = RMX_OFF;
++
++	KUNIT_EXPECT_EQ(test,
++		dm_encoder_helper_atomic_check(&ctx->aenc->base,
++					       ctx->crtc_state,
++					       &ctx->dm_state->base), 0);
++	KUNIT_EXPECT_EQ(test, (int)ctx->dm_state->scaling, (int)RMX_FULL);
++}
++
++/**
++ * dm_test_atomic_check_imac5k_keeps_user_scaling - Test iMac 5K respects a chosen scaling mode
++ * @test: The KUnit test context
++ *
++ * The iMac 5K fallback applies only while the scaling property is RMX_OFF;
++ * a scaling mode chosen by userspace is left unchanged.
++ */
++static void dm_test_atomic_check_imac5k_keeps_user_scaling(struct kunit *test)
++{
++	struct dm_test_atomic_check_ctx *ctx =
++		dm_test_atomic_check_ctx_alloc(test, DRM_MODE_CONNECTOR_eDP);
++
++	ctx->dc->config.imac5k_support = true;
++	ctx->aenc->native_mode.hdisplay = 2560;
++	ctx->aenc->native_mode.vdisplay = 2880;
++	ctx->crtc_state->adjusted_mode.hdisplay = 2560;
++	ctx->crtc_state->adjusted_mode.vdisplay = 1440;
++	ctx->dm_state->scaling = RMX_CENTER;
++
++	KUNIT_EXPECT_EQ(test,
++		dm_encoder_helper_atomic_check(&ctx->aenc->base,
++					       ctx->crtc_state,
++					       &ctx->dm_state->base), 0);
++	KUNIT_EXPECT_EQ(test, (int)ctx->dm_state->scaling, (int)RMX_CENTER);
++}
++
+ /**
+  * dm_test_atomic_check_non_mst_returns_zero - Test non-MST connectors short-circuit
+  * @test: The KUnit test context
+@@ -4581,6 +4643,96 @@ static void dm_test_atomic_check_non_mst_returns_zero(struct kunit *test)
+ 					       &ctx->dm_state->base), 0);
+ }
+ 
++/* Tests for dc_sink_is_kept_imac5k_tile() */
++
++/*
++ * Build a DP sink on link 1 with an EDID that includes an extension block:
++ * the right tile's sink once fully read when @imac5k_support is set.
++ */
++static struct dc_sink *dm_test_imac5k_sink_alloc(struct kunit *test, bool imac5k_support)
++{
++	struct dc_sink *sink;
++	struct dc_link *link;
++	struct dc *dc;
++
++	dc = kunit_kzalloc(test, sizeof(*dc), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dc);
++	link = kunit_kzalloc(test, sizeof(*link), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, link);
++	sink = kunit_kzalloc(test, sizeof(*sink), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, sink);
++
++	dc->config.imac5k_support = imac5k_support;
++	link->dc = dc;
++	link->link_index = 1;
++	sink->link = link;
++	sink->sink_signal = SIGNAL_TYPE_DISPLAY_PORT;
++	sink->dc_edid.length = 2 * DC_EDID_BLOCK_SIZE;
++
++	return sink;
++}
++
++/**
++ * dm_test_imac5k_kept_tile_right - Test the right tile's full sink is kept
++ * @test: The KUnit test context
++ */
++static void dm_test_imac5k_kept_tile_right(struct kunit *test)
++{
++	struct dc_sink *sink = dm_test_imac5k_sink_alloc(test, true);
++
++	KUNIT_EXPECT_TRUE(test, dc_sink_is_kept_imac5k_tile(sink));
++}
++
++/**
++ * dm_test_imac5k_kept_tile_base_block_only - Test a sink without the tile extension is not kept
++ * @test: The KUnit test context
++ *
++ * A failed or partial EDID read leaves only the base block, so the next
++ * detection must read the EDID again.
++ */
++static void dm_test_imac5k_kept_tile_base_block_only(struct kunit *test)
++{
++	struct dc_sink *sink = dm_test_imac5k_sink_alloc(test, true);
++
++	sink->dc_edid.length = DC_EDID_BLOCK_SIZE;
++	KUNIT_EXPECT_FALSE(test, dc_sink_is_kept_imac5k_tile(sink));
++}
++
++/**
++ * dm_test_imac5k_kept_tile_other_link - Test sinks on other links are not kept
++ * @test: The KUnit test context
++ */
++static void dm_test_imac5k_kept_tile_other_link(struct kunit *test)
++{
++	struct dc_sink *sink = dm_test_imac5k_sink_alloc(test, true);
++
++	sink->link->link_index = 2;
++	KUNIT_EXPECT_FALSE(test, dc_sink_is_kept_imac5k_tile(sink));
++}
++
++/**
++ * dm_test_imac5k_kept_tile_virtual_sink - Test a non-DP sink on link 1 is not kept
++ * @test: The KUnit test context
++ */
++static void dm_test_imac5k_kept_tile_virtual_sink(struct kunit *test)
++{
++	struct dc_sink *sink = dm_test_imac5k_sink_alloc(test, true);
++
++	sink->sink_signal = SIGNAL_TYPE_VIRTUAL;
++	KUNIT_EXPECT_FALSE(test, dc_sink_is_kept_imac5k_tile(sink));
++}
++
++/**
++ * dm_test_imac5k_kept_tile_no_quirk - Test no sink is kept without the quirk
++ * @test: The KUnit test context
++ */
++static void dm_test_imac5k_kept_tile_no_quirk(struct kunit *test)
++{
++	struct dc_sink *sink = dm_test_imac5k_sink_alloc(test, false);
++
++	KUNIT_EXPECT_FALSE(test, dc_sink_is_kept_imac5k_tile(sink));
++}
++
+ /* Tests for hdmi_cec_unset_edid() */
+ 
+ /**
+@@ -5806,7 +5958,15 @@ static struct kunit_case amdgpu_dm_connector_tests[] = {
+ 	/* dm_encoder_helper_atomic_check */
+ 	KUNIT_CASE(dm_test_atomic_check_edp_native_keeps_scaling),
+ 	KUNIT_CASE(dm_test_atomic_check_lvds_non_native_enables_scaling),
++	KUNIT_CASE(dm_test_atomic_check_imac5k_non_native_fills_panel),
++	KUNIT_CASE(dm_test_atomic_check_imac5k_keeps_user_scaling),
+ 	KUNIT_CASE(dm_test_atomic_check_non_mst_returns_zero),
++	/* dc_sink_is_kept_imac5k_tile */
++	KUNIT_CASE(dm_test_imac5k_kept_tile_right),
++	KUNIT_CASE(dm_test_imac5k_kept_tile_base_block_only),
++	KUNIT_CASE(dm_test_imac5k_kept_tile_other_link),
++	KUNIT_CASE(dm_test_imac5k_kept_tile_virtual_sink),
++	KUNIT_CASE(dm_test_imac5k_kept_tile_no_quirk),
+ 	/* hdmi_cec_unset_edid */
+ 	KUNIT_CASE(dm_test_hdmi_cec_unset_edid_no_notifier),
+ 	/* create_eml_sink */
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 871063f80..64053ecf6 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -631,6 +631,7 @@ struct dc_config {
+ 	struct spl_sharpness_range dcn_sharpness_range;
+ 	struct spl_sharpness_range dcn_override_sharpness_range;
+ 	bool no_native422_support;
++	bool imac5k_support;
+ };
+ 
+ enum visual_confirm {
+@@ -3196,6 +3197,33 @@ struct dc_sink_init_data {
+ 
+ struct dc_sink *dc_sink_create(const struct dc_sink_init_data *init_params);
+ 
++/*
++ * iMac 5K (iMac20,1 and iMac20,2): the internal 5120x2880 panel is driven as
++ * two 2560x2880 tiles, the left by eDP on link 0 and the right by DP on
++ * link 1. The right tile's receiver, HPD and AUX respond only while the
++ * left tile's receiver is powered and its Apple-specific, undocumented DPCD
++ * register 0x4F1 is 1. Every DP_SET_POWER D3 write to the left tile clears
++ * the register.
++ */
++#define IMAC5K_DPCD_RIGHT_TILE_ENABLE 0x4F1
++
++static inline bool dc_link_is_imac5k_right_tile(const struct dc_link *link)
++{
++	return link->dc->config.imac5k_support && link->link_index == 1;
++}
++
++/*
++ * The right tile's HPD follows the left tile's power state, not a cable. As
++ * for eDP, keep its sink once its EDID includes the extension block with
++ * the tile data.
++ */
++static inline bool dc_sink_is_kept_imac5k_tile(const struct dc_sink *sink)
++{
++	return dc_link_is_imac5k_right_tile(sink->link) &&
++	       sink->sink_signal == SIGNAL_TYPE_DISPLAY_PORT &&
++	       sink->dc_edid.length > DC_EDID_BLOCK_SIZE;
++}
++
+ /* Newer interfaces  */
+ struct dc_cursor {
+ 	struct dc_plane_address address;
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+index 328321961..1d85f2c4d 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+@@ -2657,7 +2657,8 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 	struct dce_hwseq *hws = dc->hwseq;
+ 	struct dc_bios *dcb = dc->ctx->dc_bios;
+ 	enum dc_status status;
+-	unsigned int i;
++	unsigned int i, n, enable_order[MAX_PIPES];
++	int left = -1, right = -1;
+ 	bool was_hpo_acquired = resource_is_hpo_acquired(dc->current_state);
+ 	bool is_hpo_acquired = resource_is_hpo_acquired(context);
+ 
+@@ -2665,6 +2666,39 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 	if (dc->config.use_pipe_ctx_sync_logic)
+ 		reset_syncd_pipes_from_disabled_pipes(dc, context);
+ 
++	/*
++	 * iMac 5K: the right tile (link 1) trains only once the left tile
++	 * (link 0) is up, so enable the left tile's master pipe first.
++	 */
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		enable_order[i] = i;
++		if (!dc->config.imac5k_support || !pipe->stream ||
++		    pipe->top_pipe || pipe->prev_odm_pipe)
++			continue;
++		if (pipe->stream->link->link_index == 0)
++			left = i;
++		else if (dc_link_is_imac5k_right_tile(pipe->stream->link))
++			right = i;
++	}
++	if (right >= 0 && left > right) {
++		enable_order[right] = left;
++		enable_order[left] = right;
++	}
++
++	/*
++	 * iMac 5K: restarting the left tile's link powers down the right
++	 * tile's receiver, so restart an unchanged right tile with it.
++	 */
++	if (left >= 0 && right >= 0) {
++		struct pipe_ctx *old = &dc->current_state->res_ctx.pipe_ctx[left];
++
++		if (!old->stream ||
++		    pipe_need_reprogram(old, &context->res_ctx.pipe_ctx[left]))
++			context->res_ctx.pipe_ctx[right].stream->link->link_state_valid = false;
++	}
++
+ 	/* Reset old context */
+ 	/* look up the targets that have been removed since last commit */
+ 	hws->funcs.reset_hw_ctx_wrap(dc, context);
+@@ -2706,10 +2740,12 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 		dc->hwseq->funcs.setup_hpo_hw_control(dc->hwseq, is_hpo_acquired);
+ 	}
+ 
+-	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++	for (n = 0; n < dc->res_pool->pipe_count; n++) {
+ 		struct pipe_ctx *pipe_ctx_old =
+-					&dc->current_state->res_ctx.pipe_ctx[i];
+-		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
++			&dc->current_state->res_ctx.pipe_ctx[enable_order[n]];
++		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[enable_order[n]];
++
++		i = enable_order[n];
+ 
+ 		if (pipe_ctx->stream == NULL)
+ 			continue;
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+index 22ad6a743..769e45e5e 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+@@ -1204,6 +1204,12 @@ static bool detect_link_and_local_sink(struct dc_link *link,
+ 					link->wa_flags.dp_keep_receiver_powered = true;
+ 			}
+ 
++			/* iMac 5K: enable the right tile before it is detected. */
++			if (dc->config.imac5k_support) {
++				const uint8_t val = 1;
++
++				core_link_write_dpcd(link, IMAC5K_DPCD_RIGHT_TILE_ENABLE, &val, 1);
++			}
+ 			sink_caps.transaction_type = DDC_TRANSACTION_TYPE_I2C_OVER_AUX;
+ 			sink_caps.signal = SIGNAL_TYPE_EDP;
+ 			break;
+@@ -1630,6 +1636,22 @@ bool link_detect(struct dc_link *link, enum dc_detect_reason reason)
+ 	bool is_delegated_to_mst_top_mgr = false;
+ 	enum dc_connection_type pre_link_type = link->type;
+ 
++	/* iMac 5K: returning false stops the HPD handlers republishing it. */
++	if (link->local_sink && dc_sink_is_kept_imac5k_tile(link->local_sink))
++		return false;
++
++	/*
++	 * iMac 5K: boot detection reaches the right tile just after the left
++	 * tile's detection has set 0x4F1, before the right tile's HPD rises,
++	 * and no interrupt reports the rise. Wait for its HPD and a DPCD read,
++	 * or leave it undetected.
++	 */
++	if (reason == DETECT_REASON_BOOT && dc_link_is_imac5k_right_tile(link) &&
++	    !link_wait_for_imac5k_right_tile(link)) {
++		DC_LOG_WARNING("iMac 5K: right tile not ready at boot\n");
++		return false;
++	}
++
+ 	is_local_sink_detect_success = detect_link_and_local_sink(link, reason);
+ 
+ 	if (is_local_sink_detect_success && link->local_sink) {
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index 25ec3d38a..f1f4256b4 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -611,6 +611,25 @@ static void update_psp_stream_config(struct pipe_ctx *pipe_ctx, bool dpms_off)
+ 	cp_psp->funcs.update_stream_config(cp_psp->handle, &config);
+ }
+ 
++/*
++ * iMac 5K: wait up to 150 ms for the right tile's HPD and a successful DPCD
++ * read. Returns false if the right tile's receiver is still not ready.
++ */
++bool link_wait_for_imac5k_right_tile(struct dc_link *link)
++{
++	unsigned long long start = dm_get_timestamp(link->ctx);
++	uint8_t rev;
++
++	while (!link_get_hpd_state(link) ||
++	       core_link_read_dpcd(link, DP_DPCD_REV, &rev, 1) != DC_OK) {
++		if (dm_get_elapse_time_in_ns(link->ctx, dm_get_timestamp(link->ctx),
++					     start) > 150 * NSEC_PER_MSEC)
++			return false;
++		fsleep(1000);
++	}
++	return true;
++}
++
+ void link_wait_for_unlocked(struct dc_link *link)
+ {
+ 	unsigned long long enter_timestamp;
+@@ -2073,6 +2092,17 @@ static enum dc_status enable_link_dp(struct dc_state *state,
+ 			!link->dc->config.enable_dpia_pre_training)
+ 		do_fallback = true;
+ 
++	/*
++	 * iMac 5K: the right tile's receiver answers only after the left
++	 * tile's D0 write has re-armed 0x4F1.
++	 */
++	if (dc_link_is_imac5k_right_tile(link) &&
++	    !link_wait_for_imac5k_right_tile(link)) {
++		DC_LOGGER_INIT(link->ctx->logger);
++
++		DC_LOG_WARNING("iMac 5K: right tile not ready for training\n");
++	}
++
+ 	/*
+ 	 * Temporary w/a to get DP2.0 link rates to work with SST.
+ 	 * TODO DP2.0 - Workaround: Remove w/a if and when the issue is resolved.
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.h b/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
+index 6559bc04d..9829036e3 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
+@@ -51,4 +51,5 @@ void link_set_dsc_on_stream(struct pipe_ctx *pipe_ctx, bool enable);
+ bool link_set_dsc_enable(struct pipe_ctx *pipe_ctx, bool enable);
+ bool link_update_dsc_config(struct pipe_ctx *pipe_ctx);
+ void link_wait_for_unlocked(struct dc_link *link);
++bool link_wait_for_imac5k_right_tile(struct dc_link *link);
+ #endif /* __DC_LINK_DPMS_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
+index 49521ac4b..d14efdbec 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
+@@ -53,6 +53,13 @@ void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
+ 	core_link_write_dpcd(link, DP_SET_POWER, &state,
+ 						 sizeof(state));
+ 
++	/* iMac 5K: D3 clears 0x4F1 on the left tile; re-arm the right tile. */
++	if (on && link->dc->config.imac5k_support &&
++	    link->connector_signal == SIGNAL_TYPE_EDP) {
++		state = 1;
++		core_link_write_dpcd(link, IMAC5K_DPCD_RIGHT_TILE_ENABLE, &state,
++				     sizeof(state));
++	}
+ }
+ 
+ void dp_enable_link_phy(
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
+index 04eedec8a..de2c2b7db 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
+@@ -1530,8 +1530,16 @@ static enum link_training_result dp_transition_to_video_idle(
+ 		 */
+ 		if (link->connector_signal != SIGNAL_TYPE_EDP && status == LINK_TRAINING_SUCCESS) {
+ 			msleep(5);
+-			if (!link->skip_fallback_on_link_loss)
++			if (dc_link_is_imac5k_right_tile(link)) {
++				uint8_t lanes;
++
++				/* iMac 5K: the right tile reports lane loss until video flows. */
++				if (core_link_read_dpcd(link, DP_LANE0_1_STATUS,
++							&lanes, 1) != DC_OK)
++					status = LINK_TRAINING_LINK_LOSS;
++			} else if (!link->skip_fallback_on_link_loss) {
+ 				status = dp_check_link_loss_status(link, lt_settings);
++			}
+ 		}
+ 		return status;
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
