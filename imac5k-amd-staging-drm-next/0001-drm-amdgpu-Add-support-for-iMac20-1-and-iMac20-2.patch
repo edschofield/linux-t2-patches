@@ -1,4 +1,4 @@
-From ab9dc0df8cbb418d5afa776872712e96655783d8 Mon Sep 17 00:00:00 2001
+From beeb3806d23b6f8ae3978d0d2b1f629ff8f7ad5e Mon Sep 17 00:00:00 2001
 From: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
 Date: Wed, 28 Oct 2026 16:44:37 +1100
 Subject: [PATCH] drm/amdgpu: Add support for iMac20,1 and iMac20,2
@@ -7,30 +7,32 @@ The internal 5120x2880 panel of the iMac20,1 and iMac20,2 is driven as
 two 2560x2880 tiles: the left by eDP on link 0 and the right by DP on
 link 1. Each tile has its own connector, grouped by the TILE property.
 The right tile's receiver, HPD and AUX respond only while the left
-tile's receiver is powered on (D0) and DPCD register 0x4F1 on the left
-tile, which is Apple-specific and undocumented, is 1. The driver must
-set this register before it can detect the right tile. In tracing, all
-36 DP_SET_POWER D3 (power-off) writes to the left tile cleared 0x4F1,
-across boot, DPMS and S3.
+tile's receiver is powered on (D0) and its DPCD register 0x4F1 is set
+to 1. This Apple-specific register is undocumented. The driver must set
+it before it can detect the right tile. In tracing, all 36 DP_SET_POWER
+D3 (power-off) writes to the left tile cleared 0x4F1, across boot, DPMS
+and S3.
 
 Match both models by DMI and, on them only:
 
 - Add the display IP blocks before the SMU. Without this, SMU
-  initialisation timed out on 13 of 20 warm boots of an iMac20,1. On an
-  iMac20,2 with only this change, 9 of 20 warm boots failed without it
-  and 0 of 100 with it. Why the order matters is not known.
+  initialisation timed out on 13 of 20 warm boots of an iMac20,1. A
+  tester with an iMac20,2 applied only this change and reported 9
+  failures in 20 warm boots without it and none in 100 with it. Why the
+  order matters is not known.
 
-- Set 0x4F1 when the left tile is detected, and again after every D0
-  write to its receiver, so that the right tile can be detected and
-  trained. At boot the right tile's HPD rises 73-83 ms after this write.
+- Set 0x4F1 when the left tile is detected, and again after each D0
+  write to its receiver through dpcd_write_rx_power_ctrl(), so that the
+  right tile can be detected and trained. At boot the right tile's HPD
+  rises 73-83 ms after this write.
 
 - Before the right tile's boot detection and before training it, wait
   up to 150 ms for its HPD and a successful DPCD read. Boot detection
   otherwise reaches it before its HPD rises, while HPD interrupts are
   still disabled. It was then found seconds later, after fbcon had sized
   the console for the left tile alone and pruned both tiles' native
-  modes. If the receiver is still not ready, boot detection leaves the
-  tile for a later HPD edge, and training goes ahead as before.
+  modes. On timeout, boot detection leaves the tile undetected for a
+  later HPD edge, and training logs a warning and goes ahead.
 
 - Enable the left tile's master pipe before the right tile's. With the
   right tile's CRTC on the lower-indexed pipe, its training failed on
@@ -73,8 +75,9 @@ Match both models by DMI and, on them only:
   through the left tile's 2560x2880 timing, which RMX_ASPECT would
   letterbox.
 
-The complete patch has been tested only on an iMac20,1; the iMac20,2
-results above are for the IP block order alone. The GPU-reset path is
+The complete patch has been tested only on an iMac20,1, using
+automated state and timing checks; the iMac20,2 results above are for
+the IP block order alone. The GPU-reset path is
 untested: a GPU reset hangs this iMac without this patch too.
 
 Signed-off-by: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
