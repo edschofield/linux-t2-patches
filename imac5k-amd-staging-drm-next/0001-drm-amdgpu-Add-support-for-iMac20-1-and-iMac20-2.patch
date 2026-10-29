@@ -1,23 +1,24 @@
-From dda27038a126918b1109cc433c5a48f4cda38d0c Mon Sep 17 00:00:00 2001
+From ab9dc0df8cbb418d5afa776872712e96655783d8 Mon Sep 17 00:00:00 2001
 From: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
 Date: Wed, 28 Oct 2026 16:44:37 +1100
-Subject: [PATCH] drm/amdgpu: Add support for the iMac 5K panel
+Subject: [PATCH] drm/amdgpu: Add support for iMac20,1 and iMac20,2
 
 The internal 5120x2880 panel of the iMac20,1 and iMac20,2 is driven as
 two 2560x2880 tiles: the left by eDP on link 0 and the right by DP on
 link 1. Each tile has its own connector, grouped by the TILE property.
 The right tile's receiver, HPD and AUX respond only while the left
-tile's receiver is powered and its Apple-specific, undocumented DPCD
-register 0x4F1 is 1, so without a write to it the right tile is never
-detected. Every DP_SET_POWER D3 write to the left tile clears the
-register (36 of 36 traced writes across boot, DPMS and S3).
+tile's receiver is powered on (D0) and DPCD register 0x4F1 on the left
+tile, which is Apple-specific and undocumented, is 1. The driver must
+set this register before it can detect the right tile. In tracing, all
+36 DP_SET_POWER D3 (power-off) writes to the left tile cleared 0x4F1,
+across boot, DPMS and S3.
 
 Match both models by DMI and, on them only:
 
 - Add the display IP blocks before the SMU. Without this, SMU
-  initialisation timed out on 13 of 20 warm boots of an iMac20,1; an
-  iMac20,2 failed 9 of 20 without it and 0 of 100 with it. Why the order
-  matters is not known.
+  initialisation timed out on 13 of 20 warm boots of an iMac20,1. On an
+  iMac20,2 with only this change, 9 of 20 warm boots failed without it
+  and 0 of 100 with it. Why the order matters is not known.
 
 - Set 0x4F1 when the left tile is detected, and again after every D0
   write to its receiver, so that the right tile can be detected and
@@ -32,18 +33,22 @@ Match both models by DMI and, on them only:
   tile for a later HPD edge, and training goes ahead as before.
 
 - Enable the left tile's master pipe before the right tile's. With the
-  right tile's CRTC on the lower pipe, its training failed on AUX; it
-  trained once the left tile was up.
+  right tile's CRTC on the lower-indexed pipe, its training failed on
+  AUX; it trained once the left tile was up.
 
-- Keep the right tile's sink once its EDID includes the extension block
-  with the tile data, as DC does for eDP, and have link_detect() return
-  early for it. Its HPD follows the left tile's power state, not a
-  cable, so otherwise DPMS publishes DP-1 as disconnected, S3 resume
-  misses the HPD rise, and resume in a scaled mode reads a 640x480 EDID
-  while 0x4F1 is clear. Forcing the connector off, or on while the panel
-  is dark, clears its published EDID; restore it from the kept sink when
-  modes are next probed. Writing 0 to the connector's debugfs
-  trigger_hotplug still releases the sink.
+- Keep the right tile's DP sink, as DC does for eDP, once its EDID is
+  longer than the base block; on this panel, the extension block holds
+  the tile data. Return early from link_detect() for the kept sink. The
+  right tile's HPD follows the left tile's power state, not a cable, so
+  otherwise DPMS publishes DP-1 as disconnected, S3 resume misses the
+  HPD rise, and resume in a scaled mode reads a 640x480 EDID while
+  0x4F1 is clear.
+
+- Forcing the right tile's connector off, or on while the panel is
+  dark, clears its published EDID, and no detection publishes the kept
+  sink again. Restore the connector's EDID from the kept sink when modes
+  are next probed. Writing 0 to the connector's debugfs trigger_hotplug
+  still releases the sink.
 
 - After training the right tile, ignore its lane status during the idle
   pattern, but still treat a failed read as link loss. The idle check
@@ -58,19 +63,25 @@ Match both models by DMI and, on them only:
   right tile's link with nothing to retrain it.
 
 - Do not attach "max bpc" to either tile. With the left stream at 8 bpc
-  and the right at 10 bpc, the right half of the panel lost its image
-  although both links stayed trained; at 8/8 and 10/10 bpc both halves
-  show. Both tiles then take their depth from the EDID.
+  and the right at 10 bpc, the whole panel showed only the left tile's
+  image, although both links stayed trained; at 8/8 and 10/10 bpc both
+  tiles show. Depth selection is left to the existing EDID-based path
+  instead of independent per-tile caps.
 
 - When a non-native mode on the left tile falls back to scaling, use
   RMX_FULL instead of RMX_ASPECT. A scaled mode drives the whole panel
   through the left tile's 2560x2880 timing, which RMX_ASPECT would
   letterbox.
 
-Only the iMac20,1 has been tested with these changes. The GPU-reset path
-is untested: a GPU reset hangs this iMac without this patch too.
+The complete patch has been tested only on an iMac20,1; the iMac20,2
+results above are for the IP block order alone. The GPU-reset path is
+untested: a GPU reset hangs this iMac without this patch too.
 
+Signed-off-by: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
+Assisted-by: GPT-6 Astra
+Assisted-by: Claude Opus 5.5
 Co-developed-by: Ed Schofield <ed@aicharmers.com>
+Signed-off-by: Ed Schofield <ed@aicharmers.com>
 ---
  drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c |  37 +++-
  .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c |   2 +
@@ -529,7 +540,7 @@ index acde20241..3b55094f3 100644
  	KUNIT_CASE(dm_test_hdmi_cec_unset_edid_no_notifier),
  	/* create_eml_sink */
 diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
-index d983bab7e..c22f4e275 100644
+index d983bab7e..f1f484fa5 100644
 --- a/drivers/gpu/drm/amd/display/dc/dc.h
 +++ b/drivers/gpu/drm/amd/display/dc/dc.h
 @@ -645,6 +645,8 @@ struct dc_config {
@@ -549,9 +560,9 @@ index d983bab7e..c22f4e275 100644
 + * iMac 5K (iMac20,1 and iMac20,2): the internal 5120x2880 panel is driven as
 + * two 2560x2880 tiles, the left by eDP on link 0 and the right by DP on
 + * link 1. The right tile's receiver, HPD and AUX respond only while the
-+ * left tile's receiver is powered and its Apple-specific, undocumented DPCD
-+ * register 0x4F1 is 1. Every DP_SET_POWER D3 write to the left tile clears
-+ * the register.
++ * left tile's receiver is powered and the left tile's Apple-specific,
++ * undocumented DPCD register 0x4F1 is 1. In tracing, every DP_SET_POWER D3
++ * write to the left tile cleared the register.
 + */
 +#define IMAC5K_DPCD_RIGHT_TILE_ENABLE 0x4F1
 +
@@ -562,8 +573,8 @@ index d983bab7e..c22f4e275 100644
 +
 +/*
 + * The right tile's HPD follows the left tile's power state, not a cable. As
-+ * for eDP, keep its sink once its EDID includes the extension block with
-+ * the tile data.
++ * for eDP, keep its sink once its EDID is longer than the base block; on
++ * this panel, the extension block holds the tile data.
 + */
 +static inline bool dc_sink_is_kept_imac5k_tile(const struct dc_sink *sink)
 +{
