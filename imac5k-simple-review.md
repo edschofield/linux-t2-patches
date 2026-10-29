@@ -28,11 +28,13 @@ his iMac20,1/20,2 scope.
 
 ## Why 7010
 
-In V3's watched test, the right half of the panel went blank after the
+In V3's watched test, the right tile's image disappeared, leaving the left
+tile's image across the whole panel, after the
 first `max bpc` change and came back at the next one. Every automated check
 passed: both streams were enabled, scanning out, flipping and trained. A
 controlled sequence showed the image loss follows unequal tile depths. With
-the left tile at 8 bpc and the right at 10, only the left half showed. At
+the left tile at 8 bpc and the right at 10, only the left tile's image
+showed, across the whole panel. At
 8/8 and 10/10 both halves showed, and restarting either tile alone at 10/10
 kept or restored both. Each tile has its own `max bpc` property, and a
 change on one tile restarts only that tile's stream, so a single property
