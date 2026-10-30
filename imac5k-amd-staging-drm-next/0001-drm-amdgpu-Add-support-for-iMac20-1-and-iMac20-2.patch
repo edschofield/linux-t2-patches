@@ -80,7 +80,6 @@ automated state and timing checks; the iMac20,2 results above are for
 the IP block order alone. The GPU-reset path is
 untested: a GPU reset hangs this iMac without this patch too.
 
-Signed-off-by: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
 Assisted-by: GPT-6 Astra
 Assisted-by: Claude Opus 5.5
 Co-developed-by: Ed Schofield <ed@aicharmers.com>
