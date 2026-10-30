@@ -1,0 +1,125 @@
+From fa3ea7105587be6af1906d88797a5c7d81e7578a Mon Sep 17 00:00:00 2001
+From: Ed Schofield <ed@aicharmers.com>
+Date: Fri, 30 Oct 2026 19:48:27 +1100
+Subject: [PATCH] DEBUG: drm/amd/display: log generic timing-sync check for the
+ iMac 5K pair
+
+Not for submission. Logs which of the generic comparisons in
+resource_are_streams_timing_synchronizable() fail for the iMac 5K tile
+pair (the eDP stream and link 1's DisplayPort stream). The check runs
+before 7003's shortcut, so the log shows the generic result whether or
+not the shortcut is present.
+
+A line is printed only when the set of failing comparisons changes,
+followed by both streams' compared fields, colour depth, encoding and
+VRR state. Read it with:
+
+  sudo dmesg | grep 'imac5k sync'
+---
+ .../gpu/drm/amd/display/dc/core/dc_resource.c | 89 +++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 4bf16f3..db088b6 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -681,10 +681,99 @@ bool resource_are_vblanks_synchronizable(
+ 	return false;
+ }
+ 
++/*
++ * Debug only, not for submission: report which of the generic checks in
++ * resource_are_streams_timing_synchronizable() fail for the iMac 5K tile
++ * pair, the eDP stream and link 1's DisplayPort stream. It runs before the
++ * iMac shortcut, so it reports the generic result whether or not the
++ * shortcut is present. It prints only when the set of failing checks
++ * changes; the counters show how often the pair was compared. Unlocked
++ * callers can race on the statics, which at worst repeats or drops a line.
++ */
++static void imac5k_debug_sync_pair(const struct dc_stream_state *s1,
++				   const struct dc_stream_state *s2,
++				   void *caller)
++{
++	static const char * const names[] = {
++		"h_total", "v_total", "h_addressable", "v_addressable",
++		"v_front_porch", "pix_clk_100hz", "c_depth", "phy_pix_clk",
++		"view_format", "ignore_msa_timing_param",
++	};
++	static unsigned int last_fail = ~0u, calls, failed;
++	const struct dc_stream_state *edp, *dp, *s;
++	unsigned int fail = 0;
++	char list[160] = "";
++	unsigned int i;
++	int len = 0;
++
++	if (s1->signal == SIGNAL_TYPE_EDP &&
++	    s2->signal == SIGNAL_TYPE_DISPLAY_PORT && s2->link->link_index == 1) {
++		edp = s1;
++		dp = s2;
++	} else if (s2->signal == SIGNAL_TYPE_EDP &&
++		   s1->signal == SIGNAL_TYPE_DISPLAY_PORT && s1->link->link_index == 1) {
++		edp = s2;
++		dp = s1;
++	} else {
++		return;
++	}
++
++	/* The same comparisons, in the same order, as the generic check. */
++	if (edp->timing.h_total != dp->timing.h_total)
++		fail |= BIT(0);
++	if (edp->timing.v_total != dp->timing.v_total)
++		fail |= BIT(1);
++	if (edp->timing.h_addressable != dp->timing.h_addressable)
++		fail |= BIT(2);
++	if (edp->timing.v_addressable != dp->timing.v_addressable)
++		fail |= BIT(3);
++	if (edp->timing.v_front_porch != dp->timing.v_front_porch)
++		fail |= BIT(4);
++	if (edp->timing.pix_clk_100hz != dp->timing.pix_clk_100hz)
++		fail |= BIT(5);
++	if (edp->clamping.c_depth != dp->clamping.c_depth)
++		fail |= BIT(6);
++	if (edp->phy_pix_clk != dp->phy_pix_clk &&
++	    (!dc_is_dp_signal(edp->signal) || !dc_is_dp_signal(dp->signal)))
++		fail |= BIT(7);
++	if (edp->view_format != dp->view_format)
++		fail |= BIT(8);
++	if (edp->ignore_msa_timing_param || dp->ignore_msa_timing_param)
++		fail |= BIT(9);
++
++	calls++;
++	if (fail)
++		failed++;
++	if (fail == last_fail)
++		return;
++	last_fail = fail;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++)
++		if (fail & BIT(i))
++			len += scnprintf(list + len, sizeof(list) - len, " %s", names[i]);
++
++	pr_info("imac5k sync: generic check %s%s (pair calls %u, failed %u, caller %pS)\n",
++		fail ? "FAILS:" : "passes", list, calls, failed, caller);
++
++	for (i = 0; i < 2; i++) {
++		s = i ? dp : edp;
++		pr_info("imac5k sync:  %s link %u: total %ux%u addr %ux%u vfp %u pix_clk_100hz %u c_depth %d display_color_depth %d encoding %d phy_pix_clk %d view_format %d ignore_msa %d vrr_active %d v_total_min %u max %u\n",
++			i ? "DP " : "eDP", s->link->link_index,
++			s->timing.h_total, s->timing.v_total,
++			s->timing.h_addressable, s->timing.v_addressable,
++			s->timing.v_front_porch, s->timing.pix_clk_100hz,
++			s->clamping.c_depth, s->timing.display_color_depth,
++			s->timing.pixel_encoding, s->phy_pix_clk, s->view_format,
++			s->ignore_msa_timing_param, s->vrr_active_variable,
++			s->adjust.v_total_min, s->adjust.v_total_max);
++	}
++}
++
+ bool resource_are_streams_timing_synchronizable(
+ 	struct dc_stream_state *stream1,
+ 	struct dc_stream_state *stream2)
+ {
++	imac5k_debug_sync_pair(stream1, stream2, __builtin_return_address(0));
+ 
+ 	if (stream1->ctx->dc->config.imac5K_support &&
+ 		((stream1->signal == SIGNAL_TYPE_EDP && stream2->signal == SIGNAL_TYPE_DISPLAY_PORT &&
