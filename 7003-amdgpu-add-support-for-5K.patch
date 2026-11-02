@@ -3,12 +3,14 @@ From: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
 Date: Tue, 3 Nov 2026 12:00:00 +1100
 Subject: [PATCH] drm/amdgpu: Add support for iMac20,1 and iMac20,2
 
-Add the iMac20,1 and iMac20,2 display quirks and tiled-panel support.
-Initialise display before SMU and retain the panel timing-sync quirk.
-Re-arm the right receiver after left-tile power-up and allow it to settle.
-Keep its sink across power-down and restore its connector EDID on probe.
-Enable the left tile first and restart the right tile when needed.
-Handle the right tile's idle lane status and keep per-tile bpc caps off.
+Add display support for the internal tiled panel on iMac20,1 and iMac20,2.
+Initialise display before the GPU power-management controller.
+Keep the original shortcut that treats the two halves as synchronized.
+Re-enable the right receiver after left-half power-up and wait 100 ms.
+Retain its detected monitor and restore its connector identification data.
+Enable the left half first and restart the right half when needed.
+Handle the right receiver's idle lane status during link training.
+Use the monitors' reported colour depths without per-connector depth caps.
 
 Co-developed-by: Ed Schofield <ed@aicharmers.com>
 ---
