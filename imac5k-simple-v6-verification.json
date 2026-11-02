@@ -1,0 +1,32 @@
+{
+  "r1": {
+    "source": "a3231b6f33646e65e36564ff0ecb9c6b61491276",
+    "upstream_base": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
+    "reconstructed_tree": "e1da3ebdf5e2f03116f158a2fd96f774228f2a07",
+    "amd_tree": "2c2ebb6f1ee374c5670d3892a7650c264a814e20",
+    "equivalent_tested_source": "fe7b174fcde8c49e1307ae5afa30073fec42829b",
+    "sha256": "9d1470faead714db5841c2769528baf169bfc2220f5b72f5f6b396377e09d9d7",
+    "stat": "12 files changed, 178 insertions(+), 11 deletions(-)",
+    "affected_blobs_match": true
+  },
+  "r2": {
+    "source": "01882b7bf9141fced2baabc983adfbbf3618f5e9",
+    "upstream_base": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
+    "reconstructed_tree": "bab222fec1baca9191d07e1d7d1f65e638b1fad9",
+    "amd_tree": "d5bd8609fdb80996d801c2da1e89959629291b22",
+    "equivalent_tested_source": "01882b7bf9141fced2baabc983adfbbf3618f5e9",
+    "sha256": "9ab15cb980b6b4251eae0969bf45e4f65727e949ebd6f9250e09bce4bf9067fd",
+    "stat": "12 files changed, 185 insertions(+), 11 deletions(-)",
+    "affected_blobs_match": true
+  },
+  "r3": {
+    "source": "291bee804da9076c01a188ec030be21d9766ee7f",
+    "upstream_base": "c03c1a14507dfaf8b856c2608f9ac216021fc222",
+    "reconstructed_tree": "0dffd8f8e65c164d264a36de0f20c5e762ff8c30",
+    "amd_tree": "1cbf1b1e5612a7c9e919735ffce57fbb4ebbbeb6",
+    "equivalent_tested_source": "4c05885df00f952491423ca769bc31c5c1407a5d",
+    "sha256": "648d6e497b9c38abfabe32f4dcffe12f044637ad8c4b4381ce3beb30c5af1c43",
+    "stat": "12 files changed, 188 insertions(+), 11 deletions(-)",
+    "affected_blobs_match": true
+  }
+}

@@ -1,28 +1,19 @@
-From 851f60c72e57d7bfb1261a133b87b61024586a45 Mon Sep 17 00:00:00 2001
+From 01882b7bf9141fced2baabc983adfbbf3618f5e9 Mon Sep 17 00:00:00 2001
 From: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
-Date: Fri, 2 Oct 2026 19:49:46 -0400
-Subject: [PATCH] amdgpu: add support for 5K
+Date: Tue, 3 Nov 2026 12:00:00 +1100
+Subject: [PATCH] drm/amdgpu: Add support for iMac20,1 and iMac20,2
 
-This patch adds support for 5K in iMac20,1 and iMac20,2.
+Add the iMac20,1 and iMac20,2 display quirks and tiled-panel support.
+Initialise display before SMU and retain the panel timing-sync quirk.
+Re-arm the right receiver after left-tile power-up and allow it to settle.
+Keep its sink across power-down and restore its connector EDID on probe.
+Enable the left tile first and restart the right tile when needed.
+Handle the right tile's idle lane status and keep per-tile bpc caps off.
 
-genlock taken from:
-https://github.com/MarkPronkin/imac5k-universal-linux-patcher/blob/main/patches/genlock-fix.patch
-
-Signed-off-by: Atharva Tiwari <atharvatiwarilinuxdev@gmail.com>
+Co-developed-by: Ed Schofield <ed@aicharmers.com>
 ---
- drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c | 31 +++++++++++--
- .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 45 ++++++++++++++++++-
- .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |  7 +++
- .../display/amdgpu_dm/amdgpu_dm_connector.c   |  7 +++
- .../amd/display/amdgpu_dm/amdgpu_dm_quirks.c  | 29 +++++++++++-
- .../gpu/drm/amd/display/dc/core/dc_resource.c |  8 ++++
- drivers/gpu/drm/amd/display/dc/dc.h           |  2 +
- .../amd/display/dc/hwss/dcn10/dcn10_hwseq.c   |  8 +++-
- .../drm/amd/display/dc/link/link_detection.c  |  5 ++-
- 9 files changed, 135 insertions(+), 7 deletions(-)
-
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
-index 7ab2ad2c5..bb672a923 100644
+index 7ab2ad2c5ba997f4a3d7bbaf4bb95dbf1c95d502..bb672a923463005b5f46b7a3dc88c9ba7eb7f4bd 100644
 --- a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
 +++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
 @@ -21,6 +21,7 @@
@@ -84,7 +75,7 @@ index 7ab2ad2c5..bb672a923 100644
  	r = amdgpu_discovery_set_gc_ip_blocks(adev);
  	if (r)
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-index 47a0ff2ed..7161f8a95 100644
+index 47a0ff2ed03592c4314a22dc5e3618d37adfd09b..154361b8b569001b3bc0790afc5e891b6fdd40e7 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 @@ -617,6 +617,8 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
@@ -108,29 +99,7 @@ index 47a0ff2ed..7161f8a95 100644
  		dm_gpureset_commit_state(dm->cached_dc_state, dm);
  
  		dm_gpureset_toggle_interrupts(adev, dm->cached_dc_state, true);
-@@ -2012,11 +2019,20 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
- 		if (!dc_link_detect_connection_type(aconnector->dc_link, &new_connection_type))
- 			drm_err(adev_to_drm(adev), "KMS: Failed to detect connector\n");
- 
--		if (aconnector->base.force && new_connection_type == dc_connection_none) {
-+		if ((aconnector->base.force && new_connection_type == dc_connection_none)
-+				|| (dm->dc->config.imac5K_support &&
-+					!dm->dc->config.imac5K_using_5K &&
-+					aconnector->dc_link->link_index == 1)) {
- 			amdgpu_dm_emulated_link_detect(aconnector->dc_link);
- 		} else {
- 			guard(mutex)(&dm->dc_lock);
- 			dc_exit_ips_for_hw_access(dm->dc);
-+			if (dm->dc->config.imac5K_using_5K &&
-+					aconnector->dc_link->link_index == 1) {
-+				const u8 value = 1;
-+
-+				core_link_write_dpcd(dm->dc->links[0], 0x4F1, &value, 1);
-+			}
- 			ret = dc_link_detect(aconnector->dc_link, DETECT_REASON_RESUMEFROMS3S4);
- 			if (ret) {
- 				/* w/a delay for certain panels */
-@@ -4627,6 +4643,25 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_commit *state,
+@@ -4627,6 +4634,25 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_commit *state,
  	dc_exit_ips_for_hw_access(dm->dc);
  	WARN_ON(!dc_commit_streams(dm->dc, &params));
  
@@ -156,23 +125,8 @@ index 47a0ff2ed..7161f8a95 100644
  	bool frl_stream_found = false;
  
  	for (i = 0; i < params.stream_count; i++) {
-@@ -5011,6 +5046,14 @@ STATIC_IFN_KUNIT void dm_enable_per_frame_crtc_master_sync(struct dc_state *cont
- 		 */
- 	}
- 
-+	if (context->streams[0]->ctx->dc->config.imac5K_support) {
-+		for (i = 0; i < context->stream_count; i++) {
-+			stream = context->streams[i];
-+			if (stream && stream->link && stream->link->link_index == 1)
-+				stream->triggered_crtc_reset.enabled = true;
-+		}
-+	}
-+
- 	set_master_stream(context->streams, context->stream_count);
- 
- 	for (i = 0; i < context->stream_count ; i++) {
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
-index 881c8d1c3..e75f04260 100644
+index 881c8d1c3cc0dfbdd0a2cfe8bb789c051796497c..e75f04260fe2b154d47a6df778062c9432b3d389 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
 @@ -689,6 +689,13 @@ struct amdgpu_display_manager {
@@ -190,7 +144,7 @@ index 881c8d1c3..e75f04260 100644
  	 * @dpia_aux_lock:
  	 *
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
-index 45a69bf43..0b6d44890 100644
+index 45a69bf43971fa6bd62aa4c65ae29efe1bfcf765..a253926e65259417bf5fc74d74b85cbe8e8891d8 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
 @@ -125,6 +125,13 @@ STATIC_IFN_KUNIT int dm_encoder_helper_atomic_check(struct drm_encoder *encoder,
@@ -198,7 +152,7 @@ index 45a69bf43..0b6d44890 100644
  			dm_new_connector_state->scaling = RMX_ASPECT;
  		}
 +
-+		if (aconnector->dc_link->dc->config.imac5K_support) {
++		if (aconnector->dc_link && aconnector->dc_link->dc->config.imac5K_support) {
 +			if (crtc_state->mode.vdisplay != 2880)
 +				dm_new_connector_state->scaling = RMX_FULL;
 +			else
@@ -207,8 +161,37 @@ index 45a69bf43..0b6d44890 100644
  		return 0;
  	}
  
+@@ -3118,9 +3125,19 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
+ 	const struct drm_edid *drm_edid = amdgpu_dm_connector->drm_edid;
+ 	struct dc_link_settings *verified_link_cap = &dc_link->verified_link_cap;
+ 	const struct dc *dc = dc_link->dc;
++	struct dc_sink *sink = amdgpu_dm_connector->dc_sink;
+ 
+ 	encoder = amdgpu_dm_connector_to_encoder(connector);
+ 
++	if (dc->config.imac5K_support && sink &&
++	    dc_sink_is_kept_imac5k_tile(sink) && !connector->edid_blob_ptr) {
++		const struct drm_edid *kept = drm_edid_alloc(sink->dc_edid.raw_edid,
++							     sink->dc_edid.length);
++
++		drm_edid_connector_update(connector, kept);
++		drm_edid_free(kept);
++	}
++
+ 	if (!drm_edid) {
+ 		amdgpu_dm_connector->num_modes =
+ 				drm_add_modes_noedid(connector, 640, 480);
+@@ -3289,7 +3306,7 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
+ 				adev->mode_info.underscan_vborder_property,
+ 				0);
+ 
+-	if (!aconnector->mst_root)
++	if (!aconnector->mst_root && !(dm->imac5K_support && link_index <= 1))
+ 		drm_connector_attach_max_bpc_property(&aconnector->base, 8, 16);
+ 
+ 	aconnector->base.state->max_bpc = 16;
 diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
-index 259966703..8657dd972 100644
+index 259966703cef5b45d13e2aa52e20bc6c265e6f27..8657dd972ee96730cfcb5ecad329543540b92583 100644
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c
 @@ -33,11 +33,13 @@
@@ -280,7 +263,7 @@ index 259966703..8657dd972 100644
  EXPORT_IF_KUNIT(retrieve_dmi_info);
  
 diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
-index fc9080f0c..4bf16f3a7 100644
+index fc9080f0c0935fb2697cb8f64f62101b92a55c8e..4bf16f3a76c009d241a832661571749454e62491 100644
 --- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
 +++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
 @@ -685,6 +685,14 @@ bool resource_are_streams_timing_synchronizable(
@@ -299,7 +282,7 @@ index fc9080f0c..4bf16f3a7 100644
  		return false;
  
 diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
-index 871063f80..022707594 100644
+index 871063f809dcff09aafad0b0cb02d4ad51ad891e..1982e2bec272911a2b3fb3692e334f7ec33a37e7 100644
 --- a/drivers/gpu/drm/amd/display/dc/dc.h
 +++ b/drivers/gpu/drm/amd/display/dc/dc.h
 @@ -631,6 +631,8 @@ struct dc_config {
@@ -311,35 +294,86 @@ index 871063f80..022707594 100644
  };
  
  enum visual_confirm {
-diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c
-index 097e4ac2d..0c9784dbb 100644
---- a/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c
-+++ b/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c
-@@ -2675,15 +2675,21 @@ void dcn10_enable_per_frame_crtc_position_reset(
- 	struct pipe_ctx *grouped_pipes[])
- {
- 	int i;
-+	int source_tg_inst = 0;
+@@ -3196,6 +3198,14 @@ struct dc_sink_init_data {
  
- 	DC_LOGGER_INIT(dc->ctx);
+ struct dc_sink *dc_sink_create(const struct dc_sink_init_data *init_params);
  
- 	DC_SYNC_INFO("Setting up\n");
-+	if (dc->config.imac5K_support &&
-+			grouped_pipes[0]->stream ==
-+			grouped_pipes[0]->stream->triggered_crtc_reset.event_source)
-+		source_tg_inst = grouped_pipes[0]->stream_res.tg->inst;
++static inline bool dc_sink_is_kept_imac5k_tile(const struct dc_sink *sink)
++{
++	return sink->link->dc->config.imac5K_support &&
++	       sink->link->link_index == 1 &&
++	       sink->sink_signal == SIGNAL_TYPE_DISPLAY_PORT &&
++	       sink->dc_edid.length > DC_EDID_BLOCK_SIZE;
++}
 +
- 	for (i = 0; i < group_size; i++)
- 		if (grouped_pipes[i]->stream_res.tg->funcs->enable_crtc_reset)
- 			grouped_pipes[i]->stream_res.tg->funcs->enable_crtc_reset(
- 					grouped_pipes[i]->stream_res.tg,
--					0,
-+					source_tg_inst,
- 					&grouped_pipes[i]->stream->triggered_crtc_reset);
+ /* Newer interfaces  */
+ struct dc_cursor {
+ 	struct dc_plane_address address;
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+index 328321961fba2699b274d26199d5fd400c459174..edffaca05756c0ddec32ef612ff8b687a729429d 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+@@ -2657,7 +2657,8 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 	struct dce_hwseq *hws = dc->hwseq;
+ 	struct dc_bios *dcb = dc->ctx->dc_bios;
+ 	enum dc_status status;
+-	unsigned int i;
++	unsigned int i, n, enable_order[MAX_PIPES];
++	int primary = -1, companion = -1;
+ 	bool was_hpo_acquired = resource_is_hpo_acquired(dc->current_state);
+ 	bool is_hpo_acquired = resource_is_hpo_acquired(context);
  
- 	DC_SYNC_INFO("Waiting for trigger\n");
+@@ -2665,6 +2666,32 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 	if (dc->config.use_pipe_ctx_sync_logic)
+ 		reset_syncd_pipes_from_disabled_pipes(dc, context);
+ 
++	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++		struct pipe_ctx *pipe = &context->res_ctx.pipe_ctx[i];
++
++		enable_order[i] = i;
++		if (!dc->config.imac5K_support || !pipe->stream ||
++		    pipe->top_pipe || pipe->prev_odm_pipe)
++			continue;
++		if (pipe->stream->link->link_index == 0)
++			primary = i;
++		else if (pipe->stream->link->link_index == 1)
++			companion = i;
++	}
++	if (companion >= 0 && primary > companion) {
++		enable_order[companion] = primary;
++		enable_order[primary] = companion;
++	}
++
++	if (primary >= 0 && companion >= 0) {
++		struct pipe_ctx *old = &dc->current_state->res_ctx.pipe_ctx[primary];
++		struct dc_link *right = context->res_ctx.pipe_ctx[companion].stream->link;
++
++		if (!old->stream ||
++		    pipe_need_reprogram(old, &context->res_ctx.pipe_ctx[primary]))
++			right->link_state_valid = false;
++	}
++
+ 	/* Reset old context */
+ 	/* look up the targets that have been removed since last commit */
+ 	hws->funcs.reset_hw_ctx_wrap(dc, context);
+@@ -2706,10 +2733,12 @@ enum dc_status dce110_apply_ctx_to_hw(
+ 		dc->hwseq->funcs.setup_hpo_hw_control(dc->hwseq, is_hpo_acquired);
+ 	}
+ 
+-	for (i = 0; i < dc->res_pool->pipe_count; i++) {
++	for (n = 0; n < dc->res_pool->pipe_count; n++) {
+ 		struct pipe_ctx *pipe_ctx_old =
+-					&dc->current_state->res_ctx.pipe_ctx[i];
+-		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
++			&dc->current_state->res_ctx.pipe_ctx[enable_order[n]];
++		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[enable_order[n]];
++
++		i = enable_order[n];
+ 
+ 		if (pipe_ctx->stream == NULL)
+ 			continue;
 diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
-index 22ad6a743..f254f2d9e 100644
+index 22ad6a7430386a2145040d70011085cea5cd3428..cfb6a710419b21cfd16b97690897fbffecc938b1 100644
 --- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
 +++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
 @@ -1203,7 +1203,10 @@ static bool detect_link_and_local_sink(struct dc_link *link,
@@ -354,6 +388,68 @@ index 22ad6a743..f254f2d9e 100644
  			sink_caps.transaction_type = DDC_TRANSACTION_TYPE_I2C_OVER_AUX;
  			sink_caps.signal = SIGNAL_TYPE_EDP;
  			break;
--- 
-2.55.0
-
+@@ -1630,6 +1633,13 @@ bool link_detect(struct dc_link *link, enum dc_detect_reason reason)
+ 	bool is_delegated_to_mst_top_mgr = false;
+ 	enum dc_connection_type pre_link_type = link->type;
+ 
++	if (link->local_sink && dc_sink_is_kept_imac5k_tile(link->local_sink))
++		return false;
++
++	if (reason == DETECT_REASON_BOOT && link->dc->config.imac5K_support &&
++	    link->link_index == 1)
++		msleep(100);
++
+ 	is_local_sink_detect_success = detect_link_and_local_sink(link, reason);
+ 
+ 	if (is_local_sink_detect_success && link->local_sink) {
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index 25ec3d38a14eb8f2069d7638731829ef89a949f5..eb2e3c55b0f4a79eeff8d1d7c82c19d698982689 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -2073,6 +2073,9 @@ static enum dc_status enable_link_dp(struct dc_state *state,
+ 			!link->dc->config.enable_dpia_pre_training)
+ 		do_fallback = true;
+ 
++	if (link->dc->config.imac5K_support && link->link_index == 1)
++		msleep(100);
++
+ 	/*
+ 	 * Temporary w/a to get DP2.0 link rates to work with SST.
+ 	 * TODO DP2.0 - Workaround: Remove w/a if and when the issue is resolved.
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
+index 49521ac4b0e85338bb7fc93c079eba45216ec700..e90164a58f20b9a94b8206470bb0c790fff339aa 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c
+@@ -53,6 +53,11 @@ void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
+ 	core_link_write_dpcd(link, DP_SET_POWER, &state,
+ 						 sizeof(state));
+ 
++	if (on && link->dc->config.imac5K_support &&
++	    link->connector_signal == SIGNAL_TYPE_EDP) {
++		state = 1;
++		core_link_write_dpcd(link, 0x4F1, &state, sizeof(state));
++	}
+ }
+ 
+ void dp_enable_link_phy(
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
+index 04eedec8a230cab91054316c63bb17dffb2b505c..818850a007ce970e2fec7d803598a8c0d8917c56 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c
+@@ -1530,8 +1530,15 @@ static enum link_training_result dp_transition_to_video_idle(
+ 		 */
+ 		if (link->connector_signal != SIGNAL_TYPE_EDP && status == LINK_TRAINING_SUCCESS) {
+ 			msleep(5);
+-			if (!link->skip_fallback_on_link_loss)
++			if (link->dc->config.imac5K_support && link->link_index == 1) {
++				uint8_t lanes;
++
++				if (core_link_read_dpcd(link, DP_LANE0_1_STATUS,
++							&lanes, 1) != DC_OK)
++					status = LINK_TRAINING_LINK_LOSS;
++			} else if (!link->skip_fallback_on_link_loss) {
+ 				status = dp_check_link_loss_status(link, lt_settings);
++			}
+ 		}
+ 		return status;
+ 	}
