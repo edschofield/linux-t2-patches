@@ -1,56 +1,84 @@
-# Simple V6 r1
+This branch contains alternative **r1**.
 
-This branch contains **r1**.
+# iMac 5K display support: three patch alternatives
 
-# Simple V6: three alternatives for review
+These patches add support for the two halves of the internal iMac20,1/iMac20,2
+screen and restore the right half after sleep. Each is a single replacement
+for patches 7003–7010 in the existing T2 Linux patch collection. Apply only one
+alternative to Linux v7.3 (`c03c1a14507dfaf8b856c2608f9ac216021fc222`).
+The other T2 patches on these branches are unchanged.
 
-These are alternative flattened replacements for 7003–7010, against Linux v7.3
-(`c03c1a14507dfaf8b856c2608f9ac216021fc222`). Apply one, not all three.
-Other T2 patches are unchanged from the published Simple V5 collection.
-This whole T2 collection is not claimed to be a newly boot-tested kernel.
+The driver normally compares display timings before treating two displays as
+synchronized. Atharva's original iMac patch bypasses those comparisons for the
+internal pair. These alternatives differ only in that shortcut:
 
-| Version | Timing shortcut | Added/deleted lines | Equivalent tested image |
-| --- | --- | --- | --- |
-| r1 | Removed | +178/−11 | NOSYNC |
-| r2 | Original 7003 shortcut | +185/−11 | CAND (`01882b7bf`) |
-| r3 | Requires matching h_total, v_total and pix_clk_100hz | +188/−11 | NARROW |
+| Version | Timing decision | Patch size |
+| --- | --- | --- |
+| r1 | Remove the shortcut and use the normal comparisons | +178/−11 lines |
+| r2 | Keep the original shortcut unchanged | +185/−11 lines |
+| r3 | Take the shortcut only when horizontal total, vertical total and pixel clock match | +188/−11 lines |
 
-Each patch changes 12 existing files. The code is otherwise identical.
-Original 7003 and production Simple V5 both already contained the shortcut.
-r1 deliberately removes it; r3 deliberately narrows it. Those alternatives
-request a change to Atharva's earlier requirement to keep it unchanged.
+Each changes 12 existing files. r3 checks `h_total`, `v_total` and
+`pix_clk_100hz`. r1 and r3 are proposed changes to Atharva's earlier request
+to keep the shortcut unchanged.
 
-Common changes preserve the reviewed combined-r1 implementation: the V5 resume
-fixes, two 100 ms sleeps instead of polling, removal of the two genlock hunks,
-and the scaling and connector fixture guards. They preserve normal S3 locking,
-use the original scaling override, and add no GPU-reset workaround or UCLK work.
-The sleep allows more time than the measured waits (up to about 53 ms at these
-sites), at a measured resume cost of about 65 ms. It does not verify readiness.
-The 0x4F1 write re-arms the companion after primary power-up; it remains unchecked,
-as in the reviewed combined implementation. Genlock removal is shared by all
-three; it is not a new change made for these exports.
+All three initialise the display before the GPU power-management controller,
+re-enable the right receiver after left-half power-up, retain its detected
+monitor across sleep, and restore its connector identification data when needed.
+They enable the left half first and restart the right half when necessary.
+They also handle the right receiver's idle lane status during link training and
+use the monitors' reported colour depths without per-connector depth caps.
 
-The failure evidence favors r3 for further review: it preserves the equal-frame
-shortcut while avoiding the observed unequal-mode failure. It is not a general
-proof that these three comparisons cover every safe synchronization case.
+The right receiver gets a fixed 100 ms sleep before initial detection and before
+training its link. Earlier measured waits at these sites reached about 53 ms.
+The fixed sleep adds about 65 ms to resume compared with the daily-use kernel's
+readiness polling; it does not itself check whether the receiver is ready.
+The write to receiver register `0x4F1` remains unchecked. The two original
+per-frame synchronization changes are omitted in all three versions. Normal
+suspend-to-RAM locking and the original scaling behavior are preserved. Small
+null checks protect existing test fixtures. No diagnostic or kernel test-file
+changes are included.
 
-Each export was applied to a pristine v7.3 index and every affected blob compared
-with its source worktree. The complete AMD subtree matches the corresponding
-existing experimental source. `verification.json` records the identities.
-No diagnostic hunks or kernel test changes are included.
+## What was tested
 
-Checkpatch was run on all three exports. r1 has one missing-sign-off error and
-three warnings; r2/r3 have that error and five warnings. One warning is the
-unsigned Co-developed-by trailer; the rest are inherited line lengths and a
-missing blank line after declarations. r3 adds no diagnostic over r2. These are
-not lint-clean submission patches. Owners must confirm final sign-offs, and
-assistance attribution must be finalized before amd-gfx submission. Codex
-(GPT-6) assisted with this preparation; no approval or sign-off is inferred.
+On 2 November, the display code corresponding to r1 completed 10 unequal-mode
+trials without a GPU timeout; r3 completed 10 valid trials without that failure.
+The trials kept the left half at its native resolution and set the right half
+to its advertised 2048×2304 mode. With r2, all seven trials that opened another
+GPU client after the mode change ended in a timeout, failed ring reset and full
+GPU reset that did not complete. The daily-use kernel, which also contains the
+original shortcut, failed its one control trial in the same way.
 
-The 2 November unequal-mode results are 10/10 clean for NOSYNC and 10/10 valid
-clean for NARROW, versus seven hard stops in seven second-client CAND trials
-and one in one production V5 trial. DML-only still failed; OTG-only was clean.
-The firmware explanation is provisional. Nobody observed these images, and
-NOSYNC/NARROW still need resume, DPMS, Cinema and attended checks. A JPEG boot
-timeout remains unresolved. iMac20,2 is untested. See the accompanying draft
-for the measured details; publishing these review branches is not submission.
+Further experiments separated the shortcut's two callers. Keeping it only for
+the display mode library's bandwidth calculations still caused the failure.
+Keeping it only for hardware timing-generator synchronization did not. This
+supports r3 for further review, but does not prove that its three comparisons
+cover every safe synchronization case. The proposed firmware explanation is
+unconfirmed.
+
+Nobody observed the panel during these trials. r1 and r3 still need their own
+resume, display power off/on, external Cinema Display and attended visual
+checks. r2 passed those automated resume and display-transition checks without
+the Cinema Display, but one boot check found a JPEG power-gating timeout that
+remains unresolved. iMac20,2 has not been tested. No benchmark comparison has
+been reproduced for these alternatives.
+
+## Source and submission checks
+
+Each patch applies to clean v7.3 and reproduces all 12 changed files from its
+corresponding tested kernel. To reproduce the complete AMD driver tree also
+requires T2 patch 2009, which adds a GPU-probe deferral check, and patch 6001,
+which sets machine-specific power-management feature masks. Their role must
+be resolved before claiming the standalone upstream patch is validated.
+The whole collection of T2 patches on these branches is not claimed to have
+been newly boot-tested. The accompanying verification JSON records source
+identities and hashes for reproducibility.
+
+The kernel's checkpatch tool reported one missing-sign-off error for each
+alternative, plus three warnings for r1 and five for r2/r3. One warning concerns
+the unsigned co-developer credit; the others concern inherited line lengths and
+a missing blank line after declarations. These results were obtained before the
+plain-language commit-description edit; the code is unchanged. Final sign-offs
+and the requested Assisted-by attribution still need to be added before
+submission to the AMD graphics mailing list. Claude and Codex (GPT-6) helped
+with testing and preparation. These are review patches, not approved submissions.
