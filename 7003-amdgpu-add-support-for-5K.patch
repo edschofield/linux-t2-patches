@@ -5,7 +5,7 @@ Subject: [PATCH] drm/amdgpu: Add support for iMac20,1 and iMac20,2
 
 Add display support for the internal tiled panel on iMac20,1 and iMac20,2.
 Initialise display before the GPU power-management controller.
-Use that shortcut only when both halves have matching frame totals and clocks.
+Take the timing-sync shortcut only when frame totals and clocks match.
 Re-enable the right receiver after left-half power-up and wait 100 ms.
 Retain its detected monitor and restore its connector identification data.
 Enable the left half first and restart the right half when needed.

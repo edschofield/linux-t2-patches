@@ -56,12 +56,20 @@ supports r3 for further review, but does not prove that its three comparisons
 cover every safe synchronization case. The proposed firmware explanation is
 unconfirmed.
 
-Nobody observed the panel during these trials. r1 and r3 still need their own
-resume, display power off/on, external Cinema Display and attended visual
-checks. r2 passed those automated resume and display-transition checks without
-the Cinema Display, but one boot check found a JPEG power-gating timeout that
-remains unresolved. iMac20,2 has not been tested. No benchmark comparison has
-been reproduced for these alternatives.
+On 3 November, the kernel corresponding to r3 passed a short unattended smoke
+test without the Cinema Display: one boot check, five display power off/on
+cycles, three suspend-to-RAM cycles, one suspend at each of 2560×1440 and
+3840×2160, one blank-then-suspend cycle, one seam timing run and one restart
+check in each CRTC assignment. Depth stayed at 10 bits per component wherever
+recorded, and the connector identification data did not change. This is not
+full acceptance.
+
+Nobody observed the panel during these trials. r3 still needs the full resume
+and display power off/on repetitions, a cold start, external Cinema Display and
+attended visual checks; r1 has had none of these. r2 passed the automated resume
+and display-transition checks without the Cinema Display, but one boot check found
+a JPEG power-gating timeout that remains unresolved. iMac20,2 has not been tested.
+No benchmark comparison has been reproduced for these alternatives.
 
 ## Source and submission checks
 
@@ -77,8 +85,8 @@ identities and hashes for reproducibility.
 The kernel's checkpatch tool reported one missing-sign-off error for each
 alternative, plus three warnings for r1 and five for r2/r3. One warning concerns
 the unsigned co-developer credit; the others concern inherited line lengths and
-a missing blank line after declarations. These results were obtained before the
-plain-language commit-description edit; the code is unchanged. Final sign-offs
+a missing blank line after declarations. These counts were rechecked on the final
+descriptions on 3 November. Final sign-offs
 and the requested Assisted-by attribution still need to be added before
 submission to the AMD graphics mailing list. Claude and Codex (GPT-6) helped
 with testing and preparation. These are review patches, not approved submissions.
