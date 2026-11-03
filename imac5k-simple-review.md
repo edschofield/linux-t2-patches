@@ -86,7 +86,7 @@ The kernel's checkpatch tool reported one missing-sign-off error for each
 alternative, plus three warnings for r1 and five for r2/r3. One warning concerns
 the unsigned co-developer credit; the others concern inherited line lengths and
 a missing blank line after declarations. These counts were rechecked on the final
-descriptions on 3 November. Final sign-offs
-and the requested Assisted-by attribution still need to be added before
+descriptions on 3 November, after adding the Assisted-by tags Atharva requested
+for GPT-6 Astra and Claude Opus 5.5. Final sign-offs still need to be added before
 submission to the AMD graphics mailing list. Claude and Codex (GPT-6) helped
 with testing and preparation. These are review patches, not approved submissions.

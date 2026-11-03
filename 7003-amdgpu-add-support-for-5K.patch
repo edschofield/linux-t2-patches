@@ -12,7 +12,9 @@ Enable the left half first and restart the right half when needed.
 Handle the right receiver's idle lane status during link training.
 Use the monitors' reported colour depths without per-connector depth caps.
 
-Co-developed-by: Ed Schofield <ed@aicharmers.com>
+Assisted-by: GPT-6 Astra
+Assisted-by: Claude Opus 5.5
+Co-developed-by: Ed Schofield <ed@charmerstraining.com>
 ---
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c
 index 7ab2ad2c5ba997f4a3d7bbaf4bb95dbf1c95d502..bb672a923463005b5f46b7a3dc88c9ba7eb7f4bd 100644
